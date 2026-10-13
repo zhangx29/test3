@@ -1,0 +1,13 @@
+numpy
+scipy
+pandas
+openpyxl
+
+[bloomberg]
+xbbg
+
+[dev]
+pytest
+
+[excel]
+xlwings
