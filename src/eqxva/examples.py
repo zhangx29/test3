@@ -14,7 +14,7 @@ TRADE_COLUMNS = ["trade_id", "netting_set", "leg_id", "leg_type", "underlying", 
                  "option_type", "strike", "option_maturity", "vol_override", "ovme_price", "comment"]
 
 NS_COLUMNS = ["netting_set", "counterparty", "collateralized", "threshold_cp", "threshold_bank", "mta",
-              "ia_received", "ia_posted", "ia_posted_segregated", "mpor_days", "rounding"]
+              "ia_received", "ia_posted", "ia_posted_segregated", "mpor_days", "rounding", "csa_ccy"]
 
 
 def _trs(tid, ns, leg, und, direction, shares, maturity, reset, spread, basis="CURRENT", avg=None,
@@ -43,15 +43,24 @@ def example_sheets() -> dict[str, pd.DataFrame]:
         ("antithetic", "Y"),
         ("epe_horizon", "1Y"),
         ("analytic_nodes", 201),
+        ("reporting_ccy", "USD"),
     ], columns=["key", "value"])
     market = pd.DataFrame([
         dict(underlying="STOCK_A", spot=100.0, div_yield=0.015, is_index="N", flat_vol=0.28,
-             bbg_ticker="AAPL US Equity"),
+             bbg_ticker="AAPL US Equity", ccy="USD"),
         dict(underlying="INDEX_X", spot=5000.0, div_yield=0.018, is_index="Y", flat_vol=0.18,
-             bbg_ticker="SPX Index"),
+             bbg_ticker="SPX Index", ccy="USD"),
+        dict(underlying="STOCK_CA", spot=67.44, div_yield=0.0297, is_index="N", flat_vol=0.2576,
+             bbg_ticker="TOU CN Equity", ccy="CAD"),
     ])
-    curve = pd.DataFrame(dict(tenor=["1M", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y"],
-                              zero_rate=[0.0410, 0.0405, 0.0395, 0.0380, 0.0365, 0.0360, 0.0362, 0.0375]))
+    # USD SOFR OIS and CAD CORRA OIS zero rates (example values - replace with live marks)
+    tenors = ["1M", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y"]
+    curve = pd.DataFrame(dict(
+        tenor=tenors * 2,
+        zero_rate=[0.0410, 0.0405, 0.0395, 0.0380, 0.0365, 0.0360, 0.0362, 0.0375,
+                   0.0225, 0.0225, 0.0225, 0.0228, 0.0240, 0.0252, 0.0270, 0.0300],
+        ccy=["USD"] * 8 + ["CAD"] * 8))
+    fx = pd.DataFrame([dict(pair="USDCAD", bbg_ticker="USDCAD Curncy", spot=1.40)])
     vrows = []
     smile = {0.8: 0.06, 0.9: 0.03, 1.0: 0.0, 1.1: -0.015, 1.2: -0.02}
     term = {"1M": 0.30, "3M": 0.29, "6M": 0.285, "1Y": 0.28, "2Y": 0.275, "5Y": 0.27}
@@ -68,6 +77,9 @@ def example_sheets() -> dict[str, pd.DataFrame]:
         dict(netting_set="NS_DELTA", counterparty="Delta Pension", collateralized="Y", threshold_cp=1000000,
              threshold_bank=1000000, mta=100000, ia_received=500000, ia_posted=0, ia_posted_segregated="Y",
              mpor_days=10),
+        dict(netting_set="NS_EPSILON", counterparty="Epsilon Asset Mgmt", collateralized="Y",
+             threshold_cp=8000000, threshold_bank=1e15, mta=400000, ia_received=0, ia_posted=0,
+             ia_posted_segregated="Y", mpor_days=10, csa_ccy="CAD"),
     ], columns=NS_COLUMNS)
     trades = pd.DataFrame([
         _trs("T001", "NS_ALPHA", "L1", "STOCK_A", "RECEIVE_EQUITY", 100000, "3Y", "3M", 0.0050,
@@ -88,8 +100,10 @@ def example_sheets() -> dict[str, pd.DataFrame]:
         _opt("T008", "NS_DELTA", "L1", "INDEX_X", "BUY", "CALL", 2000, 5200, "2Y", comment="long index call"),
         _trs("T009", "NS_DELTA", "L1", "INDEX_X", "RECEIVE_EQUITY", 1000, "5Y", "6M", 0.0030,
              comment="index TRS, semi-annual reset"),
+        _opt("T010", "NS_EPSILON", "L1", "STOCK_CA", "BUY", "CALL", 1000000, 75.0, "2027-02-27",
+             comment="CAD stock call under a CAD CSA (C$ thresholds), reported in USD"),
     ], columns=TRADE_COLUMNS)
-    return dict(Config=config, Market=market, Curve=curve, VolSurface=vol, Correlation=corr,
+    return dict(Config=config, Market=market, Curve=curve, FX=fx, VolSurface=vol, Correlation=corr,
                 NettingSets=ns, Trades=trades)
 
 

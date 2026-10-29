@@ -261,3 +261,112 @@ def test_saccr_margined_rc_floor_and_mf():
     r = saccr(ns.legs, 0.0, {"ABC": np.array([100.0])}, np.array([0.0]), ns.csa, mkt)
     assert r["RC"][0] == pytest.approx(20000 + 5000 - 3000)
     assert r["AddOn"][0] == pytest.approx(0.32 * 1e5 * 1.5 * np.sqrt(10 / 250))
+
+
+# ----------------------------------------------------------------------------- buckets / input guards
+def test_average_bucket_straddling_maturity_uses_full_width():
+    mkt = market()
+    nss, _ = build([opt(direction="BUY", otype="CALL", strike=100.0, expiry="4M")], mkt)
+    c = cfg(buckets="3M,6M", mode="AVERAGE", n=4000)
+    res = run_monte_carlo(nss, mkt, c)
+    g = res.grid_profile
+    t0, t1 = c.bucket_times()
+    live = g[(g.t >= t0 - 1e-9)]
+    expected = np.trapezoid(live.EE, live.t) / (t1 - t0)
+    ee6m = res.ns_profile.EE.iloc[1]
+    assert ee6m > 0
+    assert ee6m == pytest.approx(expected, rel=1e-9)
+    assert ee6m < 0.5 * res.ns_profile.EE.iloc[0]     # ~1 month live out of a 3-month bucket
+
+
+@pytest.mark.parametrize("strike, warns", [(1.1121, True), ("11.21%", True), (75.0, False), ("111.21%", False)])
+def test_strike_far_below_spot_warns(strike, warns):
+    mkt = market(spot=67.44)
+    _, w = build([opt(strike=strike)], mkt)
+    assert any("strike" in x for x in w) == warns
+
+
+# ----------------------------------------------------------------------------- currency
+import pandas as pd  # noqa: E402
+
+from eqxva.examples import NS_COLUMNS, TRADE_COLUMNS  # noqa: E402
+from eqxva.io_excel import parse_fx, parse_inputs  # noqa: E402
+
+AMOUNTS = ["MTM", "EE", "NEE", "PFE", "NPFE", "EE_uncoll", "NEE_uncoll", "PFE_uncoll", "FCA_exposure",
+           "FBA_exposure", "SACCR_EAD_mean", "SACCR_RC_mean", "SACCR_AddOn_mean", "SACCR_EAD_fwd"]
+
+
+def ccy_sheets(reporting="USD", usdcad=1.40, extra_trades=(), csa_ccy="CAD"):
+    """TOU-style CAD call under a CAD CSA; separate USD and CAD curves."""
+    return dict(
+        Config=pd.DataFrame([("valuation_date", "2026-10-23"), ("buckets", "1W,1M,2M,4M,6M"), ("n_paths", 4000),
+                             ("seed", 3), ("output_mode", "POINT"), ("reporting_ccy", reporting)],
+                            columns=["key", "value"]),
+        Market=pd.DataFrame([dict(underlying="TOU", spot=67.44, div_yield=0.0297, flat_vol=0.2576, ccy="CAD"),
+                             dict(underlying="SPY", spot=600.0, div_yield=0.012, flat_vol=0.18, ccy="USD")]),
+        Curve=pd.DataFrame(dict(tenor=["1M", "1Y", "1M", "1Y"], zero_rate=[0.040, 0.038, 0.0225, 0.0228],
+                                ccy=["USD", "USD", "CAD", "CAD"])),
+        FX=pd.DataFrame(dict(pair=["USDCAD Curncy"], spot=[usdcad])),
+        NettingSets=pd.DataFrame([dict(netting_set="NS", collateralized="Y", threshold_cp=8e6, threshold_bank=1e15,
+                                       mta=4e5, mpor_days=10, csa_ccy=csa_ccy)], columns=NS_COLUMNS),
+        Trades=pd.DataFrame([dict(trade_id="C", netting_set="NS", leg_type="OPTION", underlying="TOU",
+                                  direction="BUY", shares=1e6, option_type="CALL", strike=75.0,
+                                  option_maturity="2027-02-27"), *extra_trades], columns=TRADE_COLUMNS))
+
+
+def run_sheets(sheets):
+    mkt, nss, c, w = parse_inputs(sheets)
+    return mkt, run_monte_carlo(nss, mkt, c, w)
+
+
+def test_fx_pair_direction_and_crosses():
+    assert parse_fx(pd.DataFrame(dict(pair=["USDCAD"], spot=[1.40])), "USD") == {"CAD": pytest.approx(1 / 1.40)}
+    assert parse_fx(pd.DataFrame(dict(pair=["USDCAD"], spot=[1.40])), "CAD") == {"USD": pytest.approx(1.40)}
+    fx = parse_fx(pd.DataFrame(dict(pair=["EURCAD", "USDCAD"], spot=[1.50, 1.40])), "USD")
+    assert fx["EUR"] == pytest.approx(1.50 / 1.40)
+
+
+def test_reporting_ccy_scales_every_output_by_fx_forward():
+    mkt, cad = run_sheets(ccy_sheets("CAD"))
+    _, usd = run_sheets(ccy_sheets("USD"))
+    c, u = cad.ns_profile, usd.ns_profile
+    x = mkt.fx("CAD", "USD", c.t.values)                 # CAD -> USD forward, starts at 1/1.40
+    assert x[0] == pytest.approx(1 / 1.40 * mkt.curve_for("CAD").df(c.t[0]) / mkt.curve_for("USD").df(c.t[0]))
+    for col in AMOUNTS:
+        assert np.allclose(u[col], c[col] * x, rtol=1e-10, atol=1e-6), col
+    # discounted EE is the same PV whichever currency it is reported in
+    assert np.allclose(u.EE_disc, c.EE_disc / 1.40, rtol=1e-10)
+    assert (u.ccy == "USD").all() and (c.ccy == "CAD").all()
+    s_c, s_u = cad.summary.iloc[0], usd.summary.iloc[0]
+    for col in ["MTM0", "SACCR_EAD0", "SACCR_RC0", "SACCR_AddOn0"]:
+        assert s_u[col] == pytest.approx(s_c[col] / 1.40, rel=1e-12), col
+    # LegMTM stays in the leg currency (OVME reconciliation), with a reporting-ccy column added
+    lm = usd.leg_mtm.iloc[0]
+    assert lm.leg_ccy == "CAD" and lm.mtm0 == pytest.approx(cad.leg_mtm.mtm0[0])
+    assert lm.mtm0_reporting == pytest.approx(lm.mtm0 / 1.40)
+    assert 1.3e6 < lm.mtm0 < 1.7e6                       # ~C$1.5mm, not the full notional
+
+
+def test_mixed_currency_netting_set():
+    spy = dict(trade_id="S", netting_set="NS", leg_type="OPTION", underlying="SPY", direction="SELL",
+               shares=1e4, option_type="PUT", strike="95%", option_maturity="6M")
+    _, res = run_sheets(ccy_sheets("USD", extra_trades=[spy]))
+    assert res.summary.MTM0[0] == pytest.approx(res.leg_mtm.mtm0_reporting.sum(), rel=1e-12)
+    assert list(res.leg_mtm.leg_ccy) == ["CAD", "USD"]
+    # the same set under a USD CSA: SA-CCR notionals are converted, totals stay close
+    _, res_usd_csa = run_sheets(ccy_sheets("USD", extra_trades=[spy], csa_ccy="USD"))
+    assert res_usd_csa.summary.MTM0[0] == pytest.approx(res.summary.MTM0[0], rel=1e-12)
+
+
+def test_missing_fx_or_curve_or_reporting_ccy_raises():
+    s = ccy_sheets("USD")
+    s["FX"] = s["FX"].iloc[:0]
+    with pytest.raises(ValueError, match="No FX rate"):
+        parse_inputs(s)
+    s = ccy_sheets("USD")
+    s["Curve"] = s["Curve"][s["Curve"].ccy == "USD"]
+    with pytest.raises(ValueError, match="No discount curve for CAD"):
+        parse_inputs(s)
+    s = ccy_sheets("")
+    with pytest.raises(ValueError, match="reporting_ccy"):
+        parse_inputs(s)

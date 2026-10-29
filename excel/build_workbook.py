@@ -105,6 +105,9 @@ def build():
             "2. NettingSets: one row per netting set / CSA (collateralized Y/N, thresholds, MTA, IA, MPOR in business days).",
             "3. Trades: one row per leg; legs sharing a trade_id form one trade (TRS + options, collars, ...). "
             "Strike as number or text like 90% (column is text-formatted).",
+            "Currency: Market.ccy is each stock's currency, NettingSets.csa_ccy the currency of thresholds/MTA/IA, "
+            "Config.reporting_ccy the currency of every exposure output. Curve needs rows for each currency used "
+            "(ccy column) and FX the spot for each pair (e.g. USDCAD = CAD per USD). Blank ccy = reporting currency.",
             "4. Config: valuation date, time buckets (e.g. 1M,3M,6M,1Y,2Y or EVERY:3M), paths, seed, PFE quantile, "
             "output_mode AVERAGE (bucket time-average, recommended for CVA/FVA integration) or POINT.",
             "5. Pick an Action and press the button:  RUN_ALL = Monte Carlo + analytic check, RUN_MC, RUN_ANALYTIC, "
@@ -136,7 +139,7 @@ def build():
         mk = wb.sheets.add("Market", after=cfg)
         m = ex["Market"]
         mcols = ["underlying", "bbg_ticker", "is_index", "bbg_spot", "bbg_div_yield", "bbg_atm_vol",
-                 "spot_override", "div_yield_override", "vol_override", "spot", "div_yield", "flat_vol"]
+                 "spot_override", "div_yield_override", "vol_override", "spot", "div_yield", "flat_vol", "ccy"]
         mk.range("A1").value = mcols
         header(mk, len(mcols))
         for i, r in enumerate(m.itertuples(), start=2):
@@ -148,7 +151,9 @@ def build():
             mk.range((i, 10)).formula = f'=IF(G{i}<>"",G{i},D{i})'
             mk.range((i, 11)).formula = f'=IF(H{i}<>"",H{i},E{i})'
             mk.range((i, 12)).formula = f'=IF(I{i}<>"",I{i},F{i})'
+            mk.range((i, 13)).value = r.ccy
         n = len(m) + 1
+        mk.range(f"M2:M{n}").color = INPUT_FILL
         mk.range(f"A2:C{n}").color = INPUT_FILL
         mk.range(f"G2:I{n}").color = INPUT_FILL
         mk.range(f"J2:L{n}").color = CALC_FILL
@@ -156,11 +161,14 @@ def build():
 
         # ---------------------------------------------------------------- Curve
         cv = wb.sheets.add("Curve", after=mk)
-        ccols = ["tenor", "bbg_ticker", "bbg_par_rate_pct", "override", "zero_rate", "t_years"]
+        ccols = ["tenor", "bbg_ticker", "bbg_par_rate_pct", "override", "zero_rate", "t_years", "ccy", "note"]
         cv.range("A1").value = ccols
         header(cv, len(ccols))
         for i, r in enumerate(ex["Curve"].itertuples(), start=2):
-            cv.range((i, 1)).value = [r.tenor, OIS_TICKERS.get(r.tenor, "")]
+            usd = r.ccy == "USD"
+            cv.range((i, 1)).value = [r.tenor, OIS_TICKERS.get(r.tenor, "") if usd else ""]
+            cv.range((i, 7)).value = [r.ccy, "" if usd else
+                                      f"{r.ccy} OIS: enter the par-rate ticker (verify on SECF/FLDS) or an override"]
             cv.range((i, 3)).formula = f'=IFERROR(BDP(B{i},"PX_LAST"),"")'
             cv.range((i, 4)).value = r.zero_rate
             # OIS par rate (annual, %) -> continuous zero (approximation adequate for exposure)
@@ -170,11 +178,29 @@ def build():
         n = len(ex["Curve"]) + 1
         cv.range(f"A2:B{n}").color = INPUT_FILL
         cv.range(f"D2:D{n}").color = INPUT_FILL
+        cv.range(f"G2:G{n}").color = INPUT_FILL
         cv.range(f"E2:F{n}").color = CALC_FILL
         cv.autofit("c")
 
+        # ---------------------------------------------------------------- FX
+        fx = wb.sheets.add("FX", after=cv)
+        fcols = ["pair", "bbg_ticker", "bbg_spot", "override", "spot"]
+        fx.range("A1").value = fcols
+        header(fx, len(fcols))
+        for i, r in enumerate(ex["FX"].itertuples(), start=2):
+            fx.range((i, 1)).value = [r.pair, r.bbg_ticker]
+            fx.range((i, 3)).formula = f'=IFERROR(BDP(B{i},"PX_LAST"),"")'
+            fx.range((i, 4)).value = r.spot
+            fx.range((i, 5)).formula = f'=IF(D{i}<>"",D{i},C{i})'
+        n = len(ex["FX"]) + 1
+        fx.range(f"A2:B{n}").color = INPUT_FILL
+        fx.range(f"D2:D{n}").color = INPUT_FILL
+        fx.range(f"E2:E{n}").color = CALC_FILL
+        fx.range("G1").value = "pair BASEQUOTE: 1 BASE = spot QUOTE (USDCAD 1.40 = C$1.40 per US$1)"
+        fx.autofit("c")
+
         # ---------------------------------------------------------------- VolSurface
-        vs = wb.sheets.add("VolSurface", after=cv)
+        vs = wb.sheets.add("VolSurface", after=fx)
         vcols = ["underlying", "tenor", "moneyness", "bbg_field", "bbg_vol", "override", "vol"]
         vs.range("A1").value = vcols
         header(vs, len(vcols))
@@ -259,7 +285,8 @@ def build_checks(ck, col):
     ck.range("A1").value = ["EE horizon t (yrs)", 0.5, "", "Valuation date", "=Config!B2"]
     ck.range("B1").color = INPUT_FILL
     ck.range("E1").number_format = "yyyy-mm-dd"
-    ck.range("A2").value = ("Formula-only closed forms: options = Black-Scholes (flat vol, step zero rate); TRS MTM0 is "
+    ck.range("A2").value = ("Formula-only closed forms in the leg currency: options = Black-Scholes (flat vol, step zero "
+                            "rate from the underlying's currency curve); TRS MTM0 is "
                             "approximate (spread annuity on initial notional); standalone EE at t: long option = "
                             "V0/DF(t), short option = 0, no-reset TRS = Black on the forward (spread ignored).")
     cols = ["trade_id", "leg_id", "leg_type", "underlying", "S0", "q", "vol", "T_yrs", "r(T)", "K_or_ref",
@@ -283,7 +310,11 @@ def build_checks(ck, col):
         x = f'IF(C{i}="OPTION",{T["option_maturity"]}{j},{T["maturity"]}{j})'
         f["H"] = (f'=IF(A{i}="","",IF(ISNUMBER({x}),({x}-{val})/365,VALUE(LEFT({x},LEN({x})-1))*'
                   f'CHOOSE(MATCH(RIGHT({x},1),{{"D","W","M","Y"}},0),1/365,7/365,1/12,1)))')
-        f["I"] = f'=IF(A{i}="","",IFERROR(INDEX(Curve!$E:$E,MATCH(H{i},Curve!$F:$F,1)),Curve!$E$2))'
+        rep = 'IFERROR(VLOOKUP("reporting_ccy",Config!$A:$B,2,FALSE),"")'
+        ccy = (f'IF(IFERROR(INDEX(Market!$M:$M,MATCH(D{i},Market!$A:$A,0))&"","")="",{rep},'
+               f'INDEX(Market!$M:$M,MATCH(D{i},Market!$A:$A,0)))')
+        f["I"] = (f'=IF(A{i}="","",IFERROR(LOOKUP(2,1/((Curve!$G$2:$G$200={ccy})*(Curve!$F$2:$F$200<=H{i})),'
+                  f'Curve!$E$2:$E$200),IFERROR(INDEX(Curve!$E:$E,MATCH({ccy},Curve!$G:$G,0)),Curve!$E$2)))')
         k_opt = (f'IF(ISNUMBER({T["strike"]}{j}),{T["strike"]}{j},IF(RIGHT({T["strike"]}{j},1)="%",'
                  f'VALUE(SUBSTITUTE({T["strike"]}{j},"%",""))/100*E{i},VALUE({T["strike"]}{j})))')
         f["J"] = (f'=IF(A{i}="","",IF(C{i}="OPTION",{k_opt},IF(UPPER({T["notional_basis"]}{j})="AVERAGE",'

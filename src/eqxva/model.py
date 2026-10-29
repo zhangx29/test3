@@ -115,6 +115,7 @@ class CSA:
     ia_posted_segregated: bool = True
     mpor_days: int = 10            # business days
     rounding: float = 0.0
+    ccy: str = ""                  # CSA currency: thresholds, MTA, IA and netting-set values; blank = reporting
 
     @property
     def mpor_years(self) -> float:
@@ -203,7 +204,7 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
             f"{omega * shares * (und.spot - ref0):,.2f}).")
         im = 0.0
 
-    curve = mkt.curve
+    curve = mkt.curve_for(und.ccy)
     eq_dates = dt.schedule(start, mat, reset)
     periods: list[EquityPeriod] = []
     for k in range(len(eq_dates) - 1):
@@ -237,7 +238,10 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
         maturity_date=mat, reset_freq=reset)
 
 
-def build_option(row: dict, mkt: MarketData) -> OptionLeg:
+MIN_STRIKE_RATIO = 0.2   # strike / spot below this is almost certainly an input error
+
+
+def build_option(row: dict, mkt: MarketData, warnings: list[str] | None = None) -> OptionLeg:
     val = mkt.valuation_date
     und = mkt.underlyings[row["underlying"]]
     exp_field = row.get("option_maturity")
@@ -251,6 +255,11 @@ def build_option(row: dict, mkt: MarketData) -> OptionLeg:
         strike = und.spot * float(k.strip()[:-1]) / 100.0
     else:
         strike = float(k)
+    if warnings is not None and strike < MIN_STRIKE_RATIO * und.spot:
+        warnings.append(
+            f"{row['trade_id']}: strike {strike:,.4f} is only {strike / und.spot:.2%} of spot "
+            f"{und.spot:,.4f} - check the input. A moneyness must be entered as text, e.g. '111.21%' "
+            f"(Excel stores 111.21% typed into a number cell as 1.1121).")
     direction = str(row["direction"]).strip().upper()
     sign = {"BUY": 1.0, "LONG": 1.0, "SELL": -1.0, "SHORT": -1.0}[direction]
     otype = str(row["option_type"]).strip().upper()
@@ -276,7 +285,8 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
                   ia_posted=_f(r.get("ia_posted")),
                   ia_posted_segregated=str(r.get("ia_posted_segregated") or "Y").strip().upper()
                   in ("Y", "YES", "TRUE", "1"),
-                  mpor_days=int(_f(r.get("mpor_days"), 10)), rounding=_f(r.get("rounding")))
+                  mpor_days=int(_f(r.get("mpor_days"), 10)), rounding=_f(r.get("rounding")),
+                  ccy="" if _is_blank(r.get("csa_ccy")) else str(r["csa_ccy"]).strip().upper())
         sets[ns_id] = NettingSet(ns_id, str(r.get("counterparty") or ""), csa)
 
     trades: dict[str, Trade] = {}
@@ -292,7 +302,7 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
         if r["underlying"] not in mkt.underlyings:
             raise ValueError(f"{r['trade_id']}: underlying '{r['underlying']}' not in market data")
         lt = str(r["leg_type"]).strip().upper()
-        leg = build_trs(r, mkt, warnings) if lt == "TRS" else build_option(r, mkt) if lt == "OPTION" else None
+        leg = build_trs(r, mkt, warnings) if lt == "TRS" else build_option(r, mkt, warnings) if lt == "OPTION" else None
         if leg is None:
             raise ValueError(f"{r['trade_id']}: leg_type must be TRS or OPTION")
         tr = trades.get(r["trade_id"])

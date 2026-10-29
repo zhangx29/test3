@@ -30,7 +30,7 @@ def trs_value(leg, t: float, S_t, mkt: MarketData, S_fix=None):
     period's notional fixes on the path (see ``leg.fixing_time``)."""
     S_t = np.asarray(S_t, dtype=float)
     q = mkt.underlyings[leg.underlying].div_yield
-    P = mkt.curve.df_fwd
+    P = mkt.und_curve(leg.underlying).df_fwd
     out = np.zeros_like(S_t)
     eps = 1e-12
     for p in leg.periods:

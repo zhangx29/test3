@@ -36,7 +36,7 @@ def option_value(leg, t: float, S_t, mkt: MarketData):
     if tau <= 1e-12:
         return np.zeros_like(S_t)
     und = mkt.underlyings[leg.underlying]
-    df = float(mkt.curve.df_fwd(t, leg.expiry_t))
+    df = float(mkt.curve_for(und.ccy).df_fwd(t, leg.expiry_t))
     vol = float(option_vol(leg, mkt, tau))
     return leg.sign * leg.shares * bs_price(S_t, leg.strike, tau, df, und.div_yield, vol, leg.is_call)
 

@@ -1,4 +1,8 @@
-"""Market data: discount curve, dividend yield, implied-vol surface, correlations."""
+"""Market data: discount curves per currency, FX spots, dividend yield, implied-vol surface, correlations.
+
+FX is deterministic: the rate at t is the forward implied by the two discount curves,
+X(t) = X(0) * P_from(t) / P_to(t), so there is no FX volatility and no equity/FX correlation.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -69,6 +73,7 @@ class Underlying:
     is_index: bool = False
     vol: VolSurface = field(default_factory=lambda: VolSurface.flat(0.25))
     bbg_ticker: str = ""
+    ccy: str = ""                  # blank = reporting currency
 
     def forward(self, t, curve: ZeroCurve):
         return self.spot * np.exp(-self.div_yield * np.asarray(t, dtype=float)) / curve.df(t)
@@ -80,6 +85,34 @@ class MarketData:
     curve: ZeroCurve
     underlyings: dict[str, Underlying]
     correlation: dict[tuple[str, str], float] = field(default_factory=dict)
+    reporting_ccy: str = ""        # ``curve`` is this currency's curve
+    curves: dict[str, ZeroCurve] = field(default_factory=dict)    # other currencies
+    fx_spot: dict[str, float] = field(default_factory=dict)       # reporting-ccy units per 1 unit of ccy
+
+    def curve_for(self, ccy: str) -> ZeroCurve:
+        if not ccy or ccy == self.reporting_ccy:
+            return self.curve
+        if ccy not in self.curves:
+            raise ValueError(f"No discount curve for {ccy}: add Curve rows with ccy = {ccy}")
+        return self.curves[ccy]
+
+    def und_curve(self, name: str) -> ZeroCurve:
+        return self.curve_for(self.underlyings[name].ccy)
+
+    def _spot(self, ccy: str) -> float:
+        if not ccy or ccy == self.reporting_ccy:
+            return 1.0
+        if ccy not in self.fx_spot:
+            raise ValueError(f"No FX rate between {ccy} and {self.reporting_ccy}: add it to the FX sheet")
+        return self.fx_spot[ccy]
+
+    def fx(self, frm: str, to: str, t=0.0):
+        """Units of ``to`` per 1 unit of ``frm`` at time t (deterministic FX forward)."""
+        t = np.asarray(t, dtype=float)
+        if (frm or self.reporting_ccy) == (to or self.reporting_ccy):
+            return np.ones_like(t)
+        return (self._spot(frm) / self._spot(to)
+                * self.curve_for(frm).df(t) / self.curve_for(to).df(t))
 
     def rho(self, a: str, b: str) -> float:
         if a == b:

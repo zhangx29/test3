@@ -34,13 +34,13 @@ def maturity_factor(M: float, csa: CSA, margined: bool) -> float:
     return float(np.sqrt(min(max(M, FLOOR_M), 1.0)))
 
 
-def leg_terms(leg, t: float, S_t, mkt: MarketData):
-    """Return (entity, is_index, d, delta, M) for a live leg at t, else None."""
+def leg_terms(leg, t: float, S_t, mkt: MarketData, ccy: str = ""):
+    """Return (entity, is_index, d, delta, M) for a live leg at t, else None; d in ``ccy``."""
     if leg.expiry <= t + 1e-12:
         return None
     und = mkt.underlyings[leg.underlying]
     S_t = np.asarray(S_t, dtype=float)
-    d = leg.shares * S_t
+    d = leg.shares * S_t * float(mkt.fx(und.ccy, ccy, t))
     if isinstance(leg, TRSLeg):
         M = (leg.next_reset_after(t) if leg.has_reset else leg.maturity) - t
         delta = np.full_like(S_t, leg.omega)
@@ -51,7 +51,8 @@ def leg_terms(leg, t: float, S_t, mkt: MarketData):
 
 
 def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool = False):
-    """SA-CCR at time t. S: {underlying: S_t array}; V: netting-set value array (same shape).
+    """SA-CCR at time t, in the CSA currency. S: {underlying: S_t array}; V: netting-set value
+    array in the CSA currency (same shape).
     Returns dict of arrays (RC, AddOn, multiplier, PFE, EAD) and optional per-leg breakdown."""
     V = np.asarray(V, dtype=float)
     margined = csa.collateralized
@@ -60,7 +61,7 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
     en_u: dict[str, np.ndarray] = {}
     en_m: dict[str, np.ndarray] = {}
     for leg in legs:
-        terms = leg_terms(leg, t, S[leg.underlying], mkt)
+        terms = leg_terms(leg, t, S[leg.underlying], mkt, csa.ccy)
         if terms is None:
             continue
         ent, is_idx, d, delta, M = terms

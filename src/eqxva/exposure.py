@@ -1,4 +1,10 @@
-"""Monte Carlo exposure engine: EE / NEE / PFE / EPE / EEPE / funding exposure / SA-CCR profiles."""
+"""Monte Carlo exposure engine: EE / NEE / PFE / EPE / EEPE / funding exposure / SA-CCR profiles.
+
+Currency: each leg is valued in its underlying's currency and converted to the netting set's CSA
+currency at the FX forward, where collateral and SA-CCR are computed. Netting-set and trade outputs
+are then converted to the reporting currency (exact, since every statistic scales with a positive
+deterministic FX factor). LegMTM keeps the leg currency for reconciliation against OVME.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -55,17 +61,18 @@ def _idx(grid: np.ndarray, t: float) -> int:
 
 def bucketise(grid: np.ndarray, prof: np.ndarray, bt: np.ndarray, mode: str) -> np.ndarray:
     """Map a grid profile to bucket times: point value (POINT) or time-average over the bucket
-    (AVERAGE). Buckets beyond the grid horizon are 0."""
+    (AVERAGE). The profile is 0 beyond the grid horizon (everything has matured), so a bucket that
+    straddles the horizon averages the live part over the full bucket width."""
     out = np.zeros(len(bt))
     for k, t in enumerate(bt):
-        if t > grid[-1] + 1e-9:
-            continue
         if mode == "AVERAGE":
             t0 = bt[k - 1] if k > 0 else 0.0
+            if t0 > grid[-1] + 1e-9:
+                continue
             m = (grid >= t0 - 1e-9) & (grid <= t + 1e-9)
             g, p = grid[m], prof[m]
-            out[k] = np.trapezoid(p, g) / (g[-1] - g[0]) if len(g) > 1 and g[-1] > g[0] else p[-1]
-        else:
+            out[k] = np.trapezoid(p, g) / (t - t0) if len(g) > 1 and t > t0 else p[-1]
+        elif t <= grid[-1] + 1e-9:
             out[k] = np.interp(t, grid, prof)
     return out
 
@@ -86,12 +93,18 @@ def leg_value(leg, t: float, i: int, grid, S: dict, mkt: MarketData):
     return trs_value(leg, t, St, mkt, sfix)
 
 
-def value_cube(legs, grid, S, mkt) -> np.ndarray:
+def leg_ccy(leg, mkt: MarketData) -> str:
+    return mkt.underlyings[leg.underlying].ccy
+
+
+def value_cube(legs, grid, S, mkt, ccy: str = "") -> np.ndarray:
+    """Sum of the leg values on the grid, converted to ``ccy`` at the FX forward."""
     n = next(iter(S.values())).shape[0]
     V = np.zeros((n, len(grid)))
-    for i, t in enumerate(grid):
-        for leg in legs:
-            V[:, i] += leg_value(leg, t, i, grid, S, mkt)
+    for leg in legs:
+        x = mkt.fx(leg_ccy(leg, mkt), ccy, grid)
+        for i, t in enumerate(grid):
+            V[:, i] += x[i] * leg_value(leg, t, i, grid, S, mkt)
     return V
 
 
@@ -150,16 +163,24 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
     n_sa = min(saccr_paths, cfg.n_paths)
 
     ns_rows, tr_rows, sum_rows, mtm_rows, sl_rows, se_rows, grid_rows = [], [], [], [], [], [], []
+    rep = mkt.reporting_ccy
     for ns in netting_sets:
         csa = ns.csa
+        ccy = csa.ccy
+        xg = mkt.fx(ccy, rep, grid)                      # CSA currency -> reporting, along the grid
+        x0 = float(mkt.fx(ccy, rep, 0.0))
+
+        def to_rep(st):
+            return {k: v * xg for k, v in st.items()}
+
         V = np.zeros((cfg.n_paths, len(grid)))
         for tr in ns.trades:
-            Vt = value_cube(tr.legs, grid, S, mkt)
+            Vt = value_cube(tr.legs, grid, S, mkt, ccy)
             V += Vt
-            st = stats(Vt, q)
+            st = to_rep(stats(Vt, q))
             b = {k: bucketise(grid, v, bt, mode) for k, v in st.items()}
             for k, (d, t) in enumerate(zip(bdates, bt)):
-                tr_rows.append(dict(netting_set=ns.netting_set, trade_id=tr.trade_id, bucket_date=d, t=t,
+                tr_rows.append(dict(netting_set=ns.netting_set, trade_id=tr.trade_id, ccy=rep, bucket_date=d, t=t,
                                     MTM=b["MTM"][k], EE=b["EE"][k], NEE=b["NEE"][k], PFE=b["PFE"][k],
                                     EE_disc=b["EE"][k] * df_b[k], NEE_disc=b["NEE"][k] * df_b[k]))
             for leg in tr.legs:
@@ -174,21 +195,23 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
                 else:
                     row.update(maturity=leg.maturity_date, reset=leg.reset_freq or "NONE",
                                notional0=leg.shares * (leg.periods[0].ref_price or 0.0))
+                lc = leg_ccy(leg, mkt)
+                row.update(leg_ccy=lc or rep, mtm0_reporting=m0 * float(mkt.fx(lc, rep, 0.0)))
                 mtm_rows.append(row)
 
         E, _ = collateralised(V, grid, csa, ns.maturity)
-        st_c = stats(E, q)
-        st_u = stats(V, q)
+        st_c = to_rep(stats(E, q))
+        st_u = to_rep(stats(V, q))
         # funding exposure (no default): margin actually held today, i.e. CSA(V(t)) without the MPOR lag
         live = (grid < ns.maturity - 1e-9)[None, :]
         F = np.where(live, V - vm_balance(V, csa), 0.0) if csa.collateralized else V
-        fca, fba = np.maximum(F, 0).mean(0), np.minimum(F, 0).mean(0)
+        fca, fba = np.maximum(F, 0).mean(0) * xg, np.minimum(F, 0).mean(0) * xg
         eee = np.maximum.accumulate(st_c["EE"])
         h = min(h_epe, ns.maturity)
 
         # SA-CCR through time: path-wise mean (subset of paths) and deterministic forward path
         legs = ns.legs
-        Vf = value_cube(legs, grid, Sfwd, mkt)
+        Vf = value_cube(legs, grid, Sfwd, mkt, ccy)
         sa_mean = {k: np.zeros(len(bt)) for k in ("EAD", "RC", "PFE", "AddOn")}
         sa_fwd = np.zeros(len(bt))
         for k, t in enumerate(bt):
@@ -197,22 +220,26 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
             i = _idx(grid, t)
             r = saccr(legs, t, {n: S[n][:n_sa, i] for n in names}, V[:n_sa, i], csa, mkt)
             for key in sa_mean:
-                sa_mean[key][k] = float(np.mean(r[key]))
-            sa_fwd[k] = float(saccr(legs, t, {n: Sfwd[n][:, i] for n in names}, Vf[:, i], csa, mkt)["EAD"][0])
+                sa_mean[key][k] = float(np.mean(r[key])) * xg[i]
+            r_f = saccr(legs, t, {n: Sfwd[n][:, i] for n in names}, Vf[:, i], csa, mkt)
+            sa_fwd[k] = float(r_f["EAD"][0]) * xg[i]
         S0 = {n: np.array([mkt.underlyings[n].spot]) for n in names}
-        V0 = np.array([sum(leg_mtm0(l, mkt) for l in legs)])
+        V0 = np.array([sum(leg_mtm0(l, mkt) * float(mkt.fx(leg_ccy(l, mkt), ccy, 0.0)) for l in legs)])
         r0 = saccr(legs, 0.0, S0, V0, csa, mkt, breakdown=True)
         for row in r0["legs"]:
-            sl_rows.append(dict(netting_set=ns.netting_set, **row))
+            row.update(adjusted_notional=row["adjusted_notional"] * x0,
+                       effective_notional=row["effective_notional"] * x0)
+            sl_rows.append(dict(netting_set=ns.netting_set, ccy=rep, **row))
         for row in r0["entities"]:
-            se_rows.append(dict(netting_set=ns.netting_set, **row))
+            row.update(entity_addon=row["entity_addon"] * x0)
+            se_rows.append(dict(netting_set=ns.netting_set, ccy=rep, **row))
 
         bc = {k: bucketise(grid, v, bt, mode) for k, v in st_c.items()}
         bu = {k: bucketise(grid, v, bt, mode) for k, v in st_u.items()}
         bfca, bfba = bucketise(grid, fca, bt, mode), bucketise(grid, fba, bt, mode)
         for k, (d, t) in enumerate(zip(bdates, bt)):
             ns_rows.append(dict(
-                netting_set=ns.netting_set, counterparty=ns.counterparty, bucket_date=d, t=t, df=df_b[k],
+                netting_set=ns.netting_set, counterparty=ns.counterparty, ccy=rep, bucket_date=d, t=t, df=df_b[k],
                 MTM=bu["MTM"][k], EE=bc["EE"][k], NEE=bc["NEE"][k], PFE=bc["PFE"][k], NPFE=bc["NPFE"][k],
                 EE_disc=bc["EE"][k] * df_b[k], NEE_disc=bc["NEE"][k] * df_b[k],
                 EE_uncoll=bu["EE"][k], NEE_uncoll=bu["NEE"][k], PFE_uncoll=bu["PFE"][k],
@@ -222,16 +249,17 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
                 SACCR_PFE_mean=sa_mean["PFE"][k], SACCR_AddOn_mean=sa_mean["AddOn"][k],
                 SACCR_EAD_fwd=sa_fwd[k]))
         for i, t in enumerate(grid):
-            grid_rows.append(dict(netting_set=ns.netting_set, t=t, EE=st_c["EE"][i], NEE=st_c["NEE"][i],
+            grid_rows.append(dict(netting_set=ns.netting_set, ccy=rep, t=t, EE=st_c["EE"][i], NEE=st_c["NEE"][i],
                                   PFE=st_c["PFE"][i], EE_uncoll=st_u["EE"][i], NEE_uncoll=st_u["NEE"][i]))
         sum_rows.append(dict(
-            netting_set=ns.netting_set, counterparty=ns.counterparty, collateralized=csa.collateralized,
-            n_trades=len(ns.trades), maturity_yrs=ns.maturity, MTM0=float(V0[0]),
+            netting_set=ns.netting_set, counterparty=ns.counterparty, ccy=rep, csa_ccy=ccy or rep,
+            collateralized=csa.collateralized, n_trades=len(ns.trades), maturity_yrs=ns.maturity,
+            MTM0=float(V0[0]) * x0,
             EPE=time_avg(grid, st_c["EE"], h), ENE=time_avg(grid, st_c["NEE"], h),
             EEPE=time_avg(grid, eee, h), peak_EE=float(st_c["EE"].max()), peak_PFE=float(st_c["PFE"].max()),
             EPE_uncoll=time_avg(grid, st_u["EE"], h),
-            SACCR_EAD0=float(r0["EAD"][0]), SACCR_RC0=float(r0["RC"][0]),
-            SACCR_AddOn0=float(r0["AddOn"][0]), SACCR_multiplier0=float(r0["multiplier"][0]),
+            SACCR_EAD0=float(r0["EAD"][0]) * x0, SACCR_RC0=float(r0["RC"][0]) * x0,
+            SACCR_AddOn0=float(r0["AddOn"][0]) * x0, SACCR_multiplier0=float(r0["multiplier"][0]),
             n_paths=cfg.n_paths, seed=cfg.seed))
 
     return Results(pd.DataFrame(ns_rows), pd.DataFrame(tr_rows), pd.DataFrame(sum_rows),

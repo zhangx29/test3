@@ -32,8 +32,18 @@ def read_sheets(wb) -> dict[str, pd.DataFrame]:
             continue
         rng = wb.sheets[s].range("A1").expand()
         df = rng.options(pd.DataFrame, index=False, header=True, empty=np.nan).value
+        if s == "Trades" and "strike" in df.columns:
+            _percent_strikes(wb.sheets[s], df)
         out[s] = df
     return out
+
+
+def _percent_strikes(sh, df: pd.DataFrame):
+    """A strike typed as 111.21% into a number cell arrives as 1.1121: read it back as moneyness text."""
+    c = list(df.columns).index("strike") + 1
+    for i, v in enumerate(df["strike"]):
+        if isinstance(v, (int, float)) and not np.isnan(v) and "%" in str(sh.range((i + 2, c)).number_format):
+            df.iat[i, c - 1] = f"{v * 100:.10g}%"
 
 
 def _status(wb, msg: str):

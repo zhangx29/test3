@@ -28,17 +28,19 @@ def _logS_params(mkt: MarketData, name: str, t: float):
     """Mean and variance of ln S_t."""
     u = mkt.underlyings[name]
     v = float(u.vol.atm(max(t, 1e-8))) ** 2 * t if t > 0 else 0.0
-    m = np.log(float(u.forward(t, mkt.curve))) - 0.5 * v
+    m = np.log(float(u.forward(t, mkt.curve_for(u.ccy)))) - 0.5 * v
     return m, v
 
 
 def _value(legs, t, St, Sfix, mkt):
+    """Sum of leg values in the reporting currency."""
     out = np.zeros_like(St)
     for leg in legs:
+        x = float(mkt.fx(mkt.underlyings[leg.underlying].ccy, mkt.reporting_ccy, t))
         if isinstance(leg, OptionLeg):
-            out = out + option_value(leg, t, St, mkt)
+            out = out + x * option_value(leg, t, St, mkt)
         else:
-            out = out + trs_value(leg, t, St, mkt, Sfix if leg.fixing_time(t) is not None else None)
+            out = out + x * trs_value(leg, t, St, mkt, Sfix if leg.fixing_time(t) is not None else None)
     return out
 
 

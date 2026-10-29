@@ -30,8 +30,6 @@ def simulate(mkt: MarketData, names: list[str], grid: np.ndarray, n_paths: int, 
     corr = mkt.corr_matrix(names)
     L = np.linalg.cholesky(corr + 1e-12 * np.eye(m))
 
-    dfs = mkt.curve.df(grid)
-    log_df_step = np.log(dfs[1:] / dfs[:-1])          # = -r_fwd * dt
     out = {}
     Z = rng.standard_normal((n_steps, half, m)) @ L.T  # correlated normals
     if antithetic:
@@ -39,6 +37,8 @@ def simulate(mkt: MarketData, names: list[str], grid: np.ndarray, n_paths: int, 
     dt = np.diff(grid)
     for i, name in enumerate(names):
         und = mkt.underlyings[name]
+        dfs = mkt.curve_for(und.ccy).df(grid)
+        log_df_step = np.log(dfs[1:] / dfs[:-1])      # = -r_fwd * dt in the underlying's currency
         dv = forward_variance(und, grid)
         drift = -log_df_step - und.div_yield * dt - 0.5 * dv     # (n_steps,)
         inc = drift[:, None] + np.sqrt(dv)[:, None] * Z[:, :, i]  # (n_steps, n_paths)
@@ -49,4 +49,4 @@ def simulate(mkt: MarketData, names: list[str], grid: np.ndarray, n_paths: int, 
 
 def forward_path(mkt: MarketData, names: list[str], grid: np.ndarray) -> dict[str, np.ndarray]:
     """Deterministic forward path (1 path) used for the 'expected path' SA-CCR projection."""
-    return {n: mkt.underlyings[n].forward(grid, mkt.curve)[None, :] for n in names}
+    return {n: mkt.underlyings[n].forward(grid, mkt.und_curve(n))[None, :] for n in names}
