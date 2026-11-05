@@ -11,7 +11,8 @@ VAL_DATE = date(2026, 10, 9)
 TRADE_COLUMNS = ["trade_id", "netting_set", "leg_id", "leg_type", "underlying", "direction", "shares",
                  "start_date", "maturity", "equity_reset_freq", "funding_reset_freq", "funding_spread",
                  "notional_basis", "avg_price", "initial_mtm", "div_passthrough",
-                 "option_type", "strike", "option_maturity", "vol_override", "ovme_price", "comment"]
+                 "option_type", "strike", "option_maturity", "vol_override", "ovme_price", "sa_notional_basis",
+                 "spot_shock", "comment"]
 
 NS_COLUMNS = ["netting_set", "counterparty", "collateralized", "threshold_cp", "threshold_bank", "mta",
               "ia_received", "ia_posted", "ia_posted_segregated", "mpor_days", "rounding", "csa_ccy"]
@@ -40,6 +41,7 @@ def example_sheets() -> dict[str, pd.DataFrame]:
         ("pfe_quantile", 0.95),
         ("fine_step", "1W"),
         ("output_mode", "AVERAGE"),
+        ("event_buckets", "NONE"),
         ("antithetic", "Y"),
         ("epe_horizon", "1Y"),
         ("analytic_nodes", 201),

@@ -109,9 +109,16 @@ def build():
             "Config.reporting_ccy the currency of every exposure output. Curve needs rows for each currency used "
             "(ccy column) and FX the spot for each pair (e.g. USDCAD = CAD per USD). Blank ccy = reporting currency.",
             "4. Config: valuation date, time buckets (e.g. 1M,3M,6M,1Y,2Y or EVERY:3M), paths, seed, PFE quantile, "
-            "output_mode AVERAGE (bucket time-average, recommended for CVA/FVA integration) or POINT.",
+            "output_mode AVERAGE (bucket time-average, recommended for CVA/FVA integration) or POINT. "
+            "event_buckets NONE (standard buckets only), MATURITY (add each trade's maturity/expiry to its "
+            "netting set's output) or ALL (also TRS reset dates).",
             "5. Pick an Action and press the button:  RUN_ALL = Monte Carlo + analytic check, RUN_MC, RUN_ANALYTIC, "
             "BBG_REFRESH (Python xbbg -> override columns), CLEAR.",
+            "Off-market start: Trades.spot_shock (e.g. 50%) shocks the spot right after that trade was struck "
+            "(CURRENT TRS notional and % strikes stay at the current spot; Market keeps the real spot, so "
+            "shocked and unshocked copies of a trade can run side by side). Blend & extend: "
+            "notional_basis AVERAGE (or BLEND_EXTEND) with avg_price = previous strike; Trades.sa_notional_basis "
+            "MARKET/STRIKE sets the SA-CCR notional (default STRIKE for blend & extend).",
             "Outputs: Summary (EPE, EEPE, SA-CCR t0), EE_NEE (per netting set, collateralised & uncollateralised, "
             "discounted, FCA/FBA funding exposure, SA-CCR EAD profile), TradeExposure (standalone), LegMTM "
             "(incl. OVME reconciliation), SACCR_Legs / SACCR_Entities, AnalyticCheck, Charts.",
@@ -133,6 +140,7 @@ def build():
         cfg.range("B2").value = pd.Timestamp(VAL_DATE).to_pydatetime()
         cfg.range("B2").number_format = "yyyy-mm-dd"
         validation(cfg.range((list(cdf.key).index("output_mode") + 2, 2)), "AVERAGE,POINT")
+        validation(cfg.range((list(cdf.key).index("event_buckets") + 2, 2)), "NONE,MATURITY,ALL")
         cfg.autofit("c")
 
         # ---------------------------------------------------------------- Market
@@ -233,6 +241,7 @@ def build():
         tdf = ex["Trades"][TRADE_COLUMNS].copy()
         col = {c: i + 1 for i, c in enumerate(TRADE_COLUMNS)}
         tr.range((1, col["strike"]), (N_ROWS + 1, col["strike"])).number_format = "@"
+        tr.range((2, col["spot_shock"]), (N_ROWS + 1, col["spot_shock"])).number_format = "0.00%"
         tdf["strike"] = tdf["strike"].map(lambda x: "" if pd.isna(x) else str(x))
         tdf = tdf.astype(object).where(tdf.notna(), None)
         put_df(tr, tdf)

@@ -76,7 +76,7 @@ def _charts(wb, ns_profile: pd.DataFrame):
     for ch in list(sh.charts):
         ch.delete()
     sh.clear_contents()
-    cols = ["bucket_date", "EE", "NEE", "PFE", "EE_uncoll", "FCA_exposure", "SACCR_EAD_mean"]
+    cols = ["bucket_date", "EE", "NEE", "PFE", "EE_uncoll", "FCA_exposure", "SACCR_EAD_avg"]
     row = 1
     for ns, g in ns_profile.groupby("netting_set", sort=False):
         sh.range((row, 1)).value = f"Netting set {ns}"

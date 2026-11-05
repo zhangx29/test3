@@ -13,7 +13,7 @@ from .market import MarketData
 def forward_variance(und, grid: np.ndarray) -> np.ndarray:
     """Variance increments sigma^2 dt on each grid step from ATM total variance."""
     tt = np.maximum(grid, 1e-8)
-    w = und.vol.atm(tt) ** 2 * tt
+    w = und.atm_vol(tt) ** 2 * tt
     w[grid <= 0] = 0.0
     dw = np.diff(w)
     return np.maximum(dw, 0.0)
@@ -25,9 +25,11 @@ def simulate(mkt: MarketData, names: list[str], grid: np.ndarray, n_paths: int, 
     assert abs(grid[0]) < 1e-12, "grid must start at 0"
     rng = np.random.default_rng(seed)
     n_steps = len(grid) - 1
-    m = len(names)
+    roots = sorted({mkt.root(n) for n in names})   # random numbers per market underlying; a shocked
+    col = {r: k for k, r in enumerate(roots)}      # copy reuses its parent's (perfectly correlated)
+    m = len(roots)
     half = (n_paths + 1) // 2 if antithetic else n_paths
-    corr = mkt.corr_matrix(names)
+    corr = mkt.corr_matrix(roots)
     L = np.linalg.cholesky(corr + 1e-12 * np.eye(m))
 
     out = {}
@@ -35,7 +37,8 @@ def simulate(mkt: MarketData, names: list[str], grid: np.ndarray, n_paths: int, 
     if antithetic:
         Z = np.concatenate([Z, -Z], axis=1)[:, :n_paths, :]
     dt = np.diff(grid)
-    for i, name in enumerate(names):
+    for name in names:
+        i = col[mkt.root(name)]
         und = mkt.underlyings[name]
         dfs = mkt.curve_for(und.ccy).df(grid)
         log_df_step = np.log(dfs[1:] / dfs[:-1])      # = -r_fwd * dt in the underlying's currency

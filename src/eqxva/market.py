@@ -74,6 +74,28 @@ class Underlying:
     vol: VolSurface = field(default_factory=lambda: VolSurface.flat(0.25))
     bbg_ticker: str = ""
     ccy: str = ""                  # blank = reporting currency
+    ref_spot: float | None = None  # pre-shock spot: trade terms (CURRENT TRS notional, % strikes) and the
+                                   # vol surface's moneyness axis refer to it; None = no shock (= spot)
+    parent: str | None = None      # for a shocked copy: the market underlying it was derived from
+    shock: float = 0.0             # relative spot shock of a shocked copy
+
+    @property
+    def root(self) -> str:
+        """Market underlying name (the SA-CCR entity and the source of the random numbers)."""
+        return self.parent or self.name
+
+    @property
+    def trade_spot(self) -> float:
+        """Spot the trade terms were struck at (pre-shock); equals ``spot`` when there is no shock."""
+        return self.spot if self.ref_spot is None else self.ref_spot
+
+    def vol_at(self, T, K):
+        """Sticky-strike vol for strike K: the surface is quoted against the pre-shock spot."""
+        return self.vol.vol(T, K / self.trade_spot)
+
+    def atm_vol(self, T):
+        """Vol at the current spot (sticky strike: moneyness spot / pre-shock spot; 1 with no shock)."""
+        return self.vol.vol(T, self.spot / self.trade_spot)
 
     def forward(self, t, curve: ZeroCurve):
         return self.spot * np.exp(-self.div_yield * np.asarray(t, dtype=float)) / curve.df(t)
@@ -114,7 +136,27 @@ class MarketData:
         return (self._spot(frm) / self._spot(to)
                 * self.curve_for(frm).df(t) / self.curve_for(to).df(t))
 
+    def shocked(self, name: str, shock: float) -> str:
+        """Name of a copy of market underlying ``name`` whose spot is shocked by ``shock`` (relative)
+        right after the trades on it were struck; created on first use. Same vol surface (quoted
+        against the current spot, i.e. sticky strike), dividend yield, currency and random numbers."""
+        if not shock:
+            return name
+        base = self.underlyings[name]
+        pct = shock * 100.0
+        tag = f"{pct:+.0f}%" if abs(pct - round(pct)) < 1e-9 else f"{pct:+.4g}%"
+        key = f"{name}{tag}"
+        if key not in self.underlyings:
+            self.underlyings[key] = Underlying(
+                key, base.spot * (1.0 + shock), base.div_yield, base.is_index, base.vol, base.bbg_ticker,
+                base.ccy, ref_spot=base.spot, parent=name, shock=shock)
+        return key
+
+    def root(self, name: str) -> str:
+        return self.underlyings[name].root
+
     def rho(self, a: str, b: str) -> float:
+        a, b = self.root(a), self.root(b)
         if a == b:
             return 1.0
         return self.correlation.get((a, b), self.correlation.get((b, a), 0.0))

@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .exposure import Results, build_grid, bucketise
+from .exposure import Results, build_grid, bucketise, netting_set_buckets
 from .market import MarketData
 from .model import NettingSet, OptionLeg, RunConfig
 from .products import option_value, trs_value
@@ -27,7 +27,7 @@ def _nodes(n: int, width: float = 8.0):
 def _logS_params(mkt: MarketData, name: str, t: float):
     """Mean and variance of ln S_t."""
     u = mkt.underlyings[name]
-    v = float(u.vol.atm(max(t, 1e-8))) ** 2 * t if t > 0 else 0.0
+    v = float(u.atm_vol(max(t, 1e-8))) ** 2 * t if t > 0 else 0.0
     m = np.log(float(u.forward(t, mkt.curve_for(u.ccy)))) - 0.5 * v
     return m, v
 
@@ -76,10 +76,10 @@ def run_analytic(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig
                  mc: Results | None = None) -> pd.DataFrame:
     """Uncollateralised EE/NEE by bucket; if MC results are given, adds the comparison columns."""
     grid = build_grid(netting_sets, cfg)
-    bt = cfg.bucket_times()
     mode = cfg.output_mode.upper()
     rows = []
     for ns in netting_sets:
+        bdates, bt, _, btype = netting_set_buckets(ns, cfg)
         g = grid[grid <= ns.maturity + 1e-9]
         if mode == "AVERAGE":
             prof = np.array([ns_ee_nee(ns, mkt, t, cfg.analytic_nodes) for t in g])
@@ -89,8 +89,8 @@ def run_analytic(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig
             res = [ns_ee_nee(ns, mkt, t, cfg.analytic_nodes) if t <= ns.maturity + 1e-9 else (0.0, 0.0)
                    for t in bt]
             ee, nee = np.array([r[0] for r in res]), np.array([r[1] for r in res])
-        for k, (d, t) in enumerate(zip(cfg.buckets, bt)):
-            rows.append(dict(netting_set=ns.netting_set, bucket_date=d, t=t,
+        for k, (d, t) in enumerate(zip(bdates, bt)):
+            rows.append(dict(netting_set=ns.netting_set, bucket_date=d, bucket_type=btype[k], t=t,
                              EE_analytic=ee[k], NEE_analytic=nee[k]))
     out = pd.DataFrame(rows)
     if mc is not None and len(out):

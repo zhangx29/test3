@@ -25,8 +25,7 @@ def bs_price(S, K, T, df, q, vol, is_call: bool):
 def option_vol(leg, mkt: MarketData, tau):
     if leg.vol_override is not None:
         return np.full(np.shape(tau), leg.vol_override, dtype=float) + 0.0
-    und = mkt.underlyings[leg.underlying]
-    return und.vol.vol(tau, leg.strike / und.spot)
+    return mkt.underlyings[leg.underlying].vol_at(tau, leg.strike)
 
 
 def option_value(leg, t: float, S_t, mkt: MarketData):

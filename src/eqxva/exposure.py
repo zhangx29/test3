@@ -52,6 +52,49 @@ def build_grid(netting_sets: list[NettingSet], cfg: RunConfig) -> np.ndarray:
     return grid
 
 
+EVENT_BUCKET_MODES = ("NONE", "MATURITY", "ALL")
+
+
+def ns_event_times(ns: NettingSet, mode: str) -> list[float]:
+    """Event times of one netting set that become extra output buckets (see RunConfig.event_buckets)."""
+    mode = mode.upper()
+    if mode not in EVENT_BUCKET_MODES:
+        raise ValueError(f"event_buckets must be one of {', '.join(EVENT_BUCKET_MODES)} (got '{mode}')")
+    if mode == "NONE":
+        return []
+    ev = [leg.expiry for leg in ns.legs]
+    if mode == "ALL":
+        ev += [p.end for leg in ns.legs if isinstance(leg, TRSLeg) for p in leg.periods]
+    return sorted({e for e in ev if e > 0})
+
+
+def netting_set_buckets(ns: NettingSet, cfg: RunConfig):
+    """Output buckets for one netting set: the standard buckets plus, per cfg.event_buckets, the
+    netting set's own event dates up to the last standard bucket.
+
+    AVERAGE mode: an event bucket ends on the event date, so the bucket before it holds only live
+    exposure; the area under the profile (sum of value x bucket width) is unchanged.
+    POINT mode: the bucket is placed one day before the event, i.e. the last pre-settlement value
+    (on the event date itself the cash flow has settled).
+    Returns (bucket_dates, bucket_times, bucket_start_dates, bucket_types)."""
+    std_t = cfg.bucket_times()
+    ev = np.array(ns_event_times(ns, cfg.event_buckets))
+    if ev.size and cfg.output_mode.upper() == "POINT":
+        ev = ev - ONE_DAY
+    ev = ev[(ev > 1e-9) & (ev <= std_t[-1] + 1e-9)] if ev.size else ev
+    t = dt.merge_times(std_t, ev)          # a 0D standard bucket (t = 0) is kept: zero width, t0 value
+    val = cfg.valuation_date
+    std_dates = {round(x * 365): d for x, d in zip(std_t, cfg.buckets)}
+    dates, types = [], []
+    for x in t:
+        n = round(x * 365)
+        is_std = n in std_dates
+        dates.append(std_dates[n] if is_std else val + dt.timedelta(days=n))
+        types.append("STANDARD" if is_std else "EVENT")
+    starts = [val] + dates[:-1]
+    return dates, t, starts, types
+
+
 def _idx(grid: np.ndarray, t: float) -> int:
     i = int(np.searchsorted(grid, t - 1e-9))
     if i >= len(grid) or abs(grid[i] - t) > 1e-6:
@@ -154,11 +197,8 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
     names = sorted({l.underlying for ns in netting_sets for l in ns.legs})
     S = simulate(mkt, names, grid, cfg.n_paths, cfg.seed, cfg.antithetic)
     Sfwd = forward_path(mkt, names, grid)
-    bt = cfg.bucket_times()
-    bdates = cfg.buckets
     mode = cfg.output_mode.upper()
     q = cfg.pfe_quantile
-    df_b = mkt.curve.df(bt)
     h_epe = dt.tenor_years(cfg.epe_horizon)
     n_sa = min(saccr_paths, cfg.n_paths)
 
@@ -169,6 +209,8 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
         ccy = csa.ccy
         xg = mkt.fx(ccy, rep, grid)                      # CSA currency -> reporting, along the grid
         x0 = float(mkt.fx(ccy, rep, 0.0))
+        bdates, bt, bstart, btype = netting_set_buckets(ns, cfg)
+        df_b = mkt.curve.df(bt)
 
         def to_rep(st):
             return {k: v * xg for k, v in st.items()}
@@ -180,13 +222,16 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
             st = to_rep(stats(Vt, q))
             b = {k: bucketise(grid, v, bt, mode) for k, v in st.items()}
             for k, (d, t) in enumerate(zip(bdates, bt)):
-                tr_rows.append(dict(netting_set=ns.netting_set, trade_id=tr.trade_id, ccy=rep, bucket_date=d, t=t,
+                tr_rows.append(dict(netting_set=ns.netting_set, trade_id=tr.trade_id, ccy=rep, bucket_date=d,
+                                    bucket_start=bstart[k], bucket_type=btype[k], t=t,
                                     MTM=b["MTM"][k], EE=b["EE"][k], NEE=b["NEE"][k], PFE=b["PFE"][k],
                                     EE_disc=b["EE"][k] * df_b[k], NEE_disc=b["NEE"][k] * df_b[k]))
             for leg in tr.legs:
                 m0 = leg_mtm0(leg, mkt)
+                und = mkt.underlyings[leg.underlying]
                 row = dict(netting_set=ns.netting_set, trade_id=tr.trade_id, leg_id=leg.leg_id,
-                           leg_type=leg.kind, underlying=leg.underlying, mtm0=m0)
+                           leg_type=leg.kind, underlying=leg.underlying, mtm0=m0,
+                           spot=und.spot, trade_spot=und.trade_spot, spot_shock=und.shock)
                 if isinstance(leg, OptionLeg):
                     px = m0 / (leg.sign * leg.shares)
                     row.update(strike=leg.strike, expiry=leg.expiry_date, engine_px_per_share=px,
@@ -194,7 +239,12 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
                                diff_vs_ovme=None if leg.ovme_price is None else px - leg.ovme_price)
                 else:
                     row.update(maturity=leg.maturity_date, reset=leg.reset_freq or "NONE",
-                               notional0=leg.shares * (leg.periods[0].ref_price or 0.0))
+                               notional_basis=leg.notional_basis,
+                               notional0=leg.shares * (leg.periods[0].ref_price or 0.0),
+                               carried_mtm=leg.initial_mtm,
+                               carried_mtm_settle=(mkt.valuation_date + dt.timedelta(days=round(leg.im_settle * 365))
+                                                   if leg.initial_mtm else None),
+                               sa_notional_basis=leg.sa_notional_basis)
                 lc = leg_ccy(leg, mkt)
                 row.update(leg_ccy=lc or rep, mtm0_reporting=m0 * float(mkt.fx(lc, rep, 0.0)))
                 mtm_rows.append(row)
@@ -212,17 +262,36 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
         # SA-CCR through time: path-wise mean (subset of paths) and deterministic forward path
         legs = ns.legs
         Vf = value_cube(legs, grid, Sfwd, mkt, ccy)
-        sa_mean = {k: np.zeros(len(bt)) for k in ("EAD", "RC", "PFE", "AddOn")}
+        sa_mean = {k: np.zeros(len(bt)) for k in ("EAD", "RC", "PFE", "AddOn", "multiplier", "cap")}
         sa_fwd = np.zeros(len(bt))
+
+        def fix_mc(u, tf):
+            return S[u][:n_sa, _idx(grid, tf)]
+
+        def fix_fwd(u, tf):
+            return Sfwd[u][:, _idx(grid, tf)]
         for k, t in enumerate(bt):
             if t > grid[-1] + 1e-9:
                 continue
             i = _idx(grid, t)
-            r = saccr(legs, t, {n: S[n][:n_sa, i] for n in names}, V[:n_sa, i], csa, mkt)
+            r = saccr(legs, t, {n: S[n][:n_sa, i] for n in names}, V[:n_sa, i], csa, mkt, fix=fix_mc)
             for key in sa_mean:
-                sa_mean[key][k] = float(np.mean(r[key])) * xg[i]
-            r_f = saccr(legs, t, {n: Sfwd[n][:, i] for n in names}, Vf[:, i], csa, mkt)
+                fx = 1.0 if key in ("multiplier", "cap") else xg[i]
+                sa_mean[key][k] = float(np.mean(r[key])) * fx
+            r_f = saccr(legs, t, {n: Sfwd[n][:, i] for n in names}, Vf[:, i], csa, mkt, fix=fix_fwd)
             sa_fwd[k] = float(r_f["EAD"][0]) * xg[i]
+        # time-averaged EAD over each bucket (same convention as EE in AVERAGE mode): mean EAD on
+        # every grid point while the netting set is live (0 afterwards), then bucket-averaged
+        if mode == "AVERAGE":
+            ead_g = np.zeros(len(grid))
+            for i, t in enumerate(grid):
+                if t >= ns.maturity - 1e-9:
+                    break
+                r = saccr(legs, t, {n: S[n][:n_sa, i] for n in names}, V[:n_sa, i], csa, mkt, fix=fix_mc)
+                ead_g[i] = float(np.mean(r["EAD"])) * xg[i]
+            sa_avg = bucketise(grid, ead_g, bt, mode)
+        else:
+            sa_avg = sa_mean["EAD"].copy()
         S0 = {n: np.array([mkt.underlyings[n].spot]) for n in names}
         V0 = np.array([sum(leg_mtm0(l, mkt) * float(mkt.fx(leg_ccy(l, mkt), ccy, 0.0)) for l in legs)])
         r0 = saccr(legs, 0.0, S0, V0, csa, mkt, breakdown=True)
@@ -239,7 +308,8 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
         bfca, bfba = bucketise(grid, fca, bt, mode), bucketise(grid, fba, bt, mode)
         for k, (d, t) in enumerate(zip(bdates, bt)):
             ns_rows.append(dict(
-                netting_set=ns.netting_set, counterparty=ns.counterparty, ccy=rep, bucket_date=d, t=t, df=df_b[k],
+                netting_set=ns.netting_set, counterparty=ns.counterparty, ccy=rep, bucket_date=d,
+                bucket_start=bstart[k], bucket_type=btype[k], t=t, df=df_b[k],
                 MTM=bu["MTM"][k], EE=bc["EE"][k], NEE=bc["NEE"][k], PFE=bc["PFE"][k], NPFE=bc["NPFE"][k],
                 EE_disc=bc["EE"][k] * df_b[k], NEE_disc=bc["NEE"][k] * df_b[k],
                 EE_uncoll=bu["EE"][k], NEE_uncoll=bu["NEE"][k], PFE_uncoll=bu["PFE"][k],
@@ -247,7 +317,8 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
                 EE_stderr=bc["EE_se"][k], NEE_stderr=bc["NEE_se"][k],
                 SACCR_EAD_mean=sa_mean["EAD"][k], SACCR_RC_mean=sa_mean["RC"][k],
                 SACCR_PFE_mean=sa_mean["PFE"][k], SACCR_AddOn_mean=sa_mean["AddOn"][k],
-                SACCR_EAD_fwd=sa_fwd[k]))
+                SACCR_multiplier_mean=sa_mean["multiplier"][k], SACCR_cap_share=sa_mean["cap"][k],
+                SACCR_EAD_fwd=sa_fwd[k], SACCR_EAD_avg=sa_avg[k]))
         for i, t in enumerate(grid):
             grid_rows.append(dict(netting_set=ns.netting_set, ccy=rep, t=t, EE=st_c["EE"][i], NEE=st_c["NEE"][i],
                                   PFE=st_c["PFE"][i], EE_uncoll=st_u["EE"][i], NEE_uncoll=st_u["NEE"][i]))
@@ -260,6 +331,9 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
             EPE_uncoll=time_avg(grid, st_u["EE"], h),
             SACCR_EAD0=float(r0["EAD"][0]) * x0, SACCR_RC0=float(r0["RC"][0]) * x0,
             SACCR_AddOn0=float(r0["AddOn"][0]) * x0, SACCR_multiplier0=float(r0["multiplier"][0]),
+            SACCR_PFE0=float(r0["PFE"][0]) * x0,
+            SACCR_basis0=("UNMARGINED_CAP" if bool(r0["cap"][0]) else "MARGINED") if csa.collateralized
+            else "UNMARGINED",
             n_paths=cfg.n_paths, seed=cfg.seed))
 
     return Results(pd.DataFrame(ns_rows), pd.DataFrame(tr_rows), pd.DataFrame(sum_rows),

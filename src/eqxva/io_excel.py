@@ -1,7 +1,8 @@
 """Read inputs from workbook sheets (DataFrames) and write results to Excel.
 
 Input sheets (same layout in the .xlsm front end and in a plain .xlsx used by the CLI):
-  Config       key | value                            (reporting_ccy: currency of all exposure outputs)
+  Config       key | value                            (reporting_ccy: currency of all exposure outputs;
+                                                   event_buckets NONE/MATURITY/ALL: extra buckets at trade dates)
   Market       underlying | spot | div_yield | is_index | flat_vol | bbg_ticker | ccy
   Curve        tenor | zero_rate | ccy                (continuously compounded, decimal; one curve per ccy)
   FX           pair | spot                            (optional; e.g. USDCAD | 1.40 = CAD per 1 USD)
@@ -13,7 +14,8 @@ Blank ccy / csa_ccy / Curve ccy mean the reporting currency.
   Trades       trade_id | netting_set | leg_id | leg_type | underlying | direction | shares |
                start_date | maturity | equity_reset_freq | funding_reset_freq | funding_spread |
                notional_basis | avg_price | initial_mtm | div_passthrough |
-               option_type | strike | option_maturity | vol_override | ovme_price
+               option_type | strike | option_maturity | vol_override | ovme_price | sa_notional_basis |
+               spot_shock (optional, e.g. 50%: the spot moves by this much right after the trade is struck)
 """
 from __future__ import annotations
 
@@ -34,6 +36,15 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     df = df.loc[:, [c for c in df.columns if c and not c.startswith("Unnamed") and c != "None"]]
     return df.dropna(how="all")
+
+
+def _event_mode(x) -> str:
+    from .exposure import EVENT_BUCKET_MODES
+    s = "" if x is None or (isinstance(x, float) and np.isnan(x)) else str(x).strip().upper()
+    s = s or "NONE"
+    if s not in EVENT_BUCKET_MODES:
+        raise ValueError(f"Config event_buckets must be one of {', '.join(EVENT_BUCKET_MODES)} (got '{x}')")
+    return s
 
 
 def _num(x, what: str) -> float:
@@ -174,6 +185,7 @@ def parse_inputs(sheets: dict[str, pd.DataFrame]):
         antithetic=_truthy(kv.get("antithetic", "Y")),
         epe_horizon=str(kv.get("epe_horizon", "1Y")).strip().upper(),
         analytic_nodes=int(float(kv.get("analytic_nodes", 201))),
+        event_buckets=_event_mode(kv.get("event_buckets")),
     )
     return mkt, nss, cfg, warnings
 
@@ -220,7 +232,7 @@ def write_results(results, path: str | Path, inputs: dict[str, pd.DataFrame] | N
             ch.title = f"{ns}: EE / NEE / PFE"
             ch.y_axis.title = "Exposure"
             ch.x_axis.title = "Bucket"
-            for c in ("EE", "NEE", "PFE", "EE_uncoll", "SACCR_EAD_mean"):
+            for c in ("EE", "NEE", "PFE", "EE_uncoll", "SACCR_EAD_avg"):
                 ci = cols.index(c) + 1
                 ch.series.append(Series(Reference(ws, min_col=ci, min_row=r0, max_row=r1), title=c))
             ci = cols.index("bucket_date") + 1

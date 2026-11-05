@@ -4,13 +4,15 @@ EAD = alpha * (RC + PFE), alpha = 1.4
 PFE = multiplier * AddOn,  multiplier = min(1, 0.05 + 0.95 exp((V - C) / (2 * 0.95 * AddOn)))
 AddOn_equity = sqrt((sum_k rho_k A_k)^2 + sum_k (1 - rho_k^2) A_k^2),  A_k = SF_k * sum_i delta_i d_i MF_i
   SF 32% single name / 20% index, rho 50% / 80%, supervisory option vol 120% / 75%
-  d_i = shares * current price
+  d_i = shares * current price (MARKET), or for a TRS with sa_notional_basis STRIKE (default for
+  AVERAGE / blend & extend) shares * reference price of the period in force (the previous strike,
+  then the reset price once the notional re-fixes on the path)
 MF unmargined = sqrt(min(max(M, 10bd), 1y) / 1y); margined = 1.5 sqrt(MPOR / 1y) (250 business days)
 For transactions that settle outstanding exposure and reset to zero fair value on set dates
 (reset TRS), M is the time to the next reset date (CRE52.37(5)); MF floor of 10 business days
 per CRE52.48.
 RC unmargined = max(V - C, 0); margined = max(V - C, TH + MTA - NICA, 0); margined EAD capped at
-the unmargined EAD.
+the unmargined EAD (reported components are those of the binding branch). Zero once matured.
 """
 from __future__ import annotations
 
@@ -34,26 +36,48 @@ def maturity_factor(M: float, csa: CSA, margined: bool) -> float:
     return float(np.sqrt(min(max(M, FLOOR_M), 1.0)))
 
 
-def leg_terms(leg, t: float, S_t, mkt: MarketData, ccy: str = ""):
+def sa_price(leg, t: float, S_t, fix=None):
+    """Price used in the adjusted notional d = shares * price. ``fix(underlying, t_fix)`` returns S at
+    a past path fixing (needed for STRIKE basis after a reset)."""
+    S_t = np.asarray(S_t, dtype=float)
+    if isinstance(leg, TRSLeg) and leg.sa_notional_basis == "STRIKE":
+        if leg.sa_ref_price is not None:          # blend & extend with resets: previous strike for life
+            return np.full_like(S_t, leg.sa_ref_price)
+        ref, tf = leg.strike_ref(t)
+        if ref is not None:
+            return np.full_like(S_t, ref)
+        if tf is not None and fix is not None:
+            return np.asarray(fix(leg.underlying, tf), dtype=float) * np.ones_like(S_t)
+    return S_t
+
+
+def leg_terms(leg, t: float, S_t, mkt: MarketData, ccy: str = "", fix=None):
     """Return (entity, is_index, d, delta, M) for a live leg at t, else None; d in ``ccy``."""
     if leg.expiry <= t + 1e-12:
         return None
     und = mkt.underlyings[leg.underlying]
     S_t = np.asarray(S_t, dtype=float)
-    d = leg.shares * S_t * float(mkt.fx(und.ccy, ccy, t))
+    d = leg.shares * sa_price(leg, t, S_t, fix) * float(mkt.fx(und.ccy, ccy, t))
     if isinstance(leg, TRSLeg):
         M = (leg.next_reset_after(t) if leg.has_reset else leg.maturity) - t
         delta = np.full_like(S_t, leg.omega)
     else:
         M = leg.expiry - t
         delta = supervisory_delta(leg.sign, leg.is_call, S_t, leg.strike, M, SUP_VOL[und.is_index])
-    return leg.underlying, und.is_index, d, delta, M
+    return und.root, und.is_index, d, delta, M
 
 
-def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool = False):
+def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool = False, fix=None):
     """SA-CCR at time t, in the CSA currency. S: {underlying: S_t array}; V: netting-set value
     array in the CSA currency (same shape).
-    Returns dict of arrays (RC, AddOn, multiplier, PFE, EAD) and optional per-leg breakdown."""
+
+    Returns dict of arrays RC, AddOn, multiplier, PFE, EAD and cap (bool). For a margined netting
+    set the EAD is min(margined, unmargined) path by path, and RC / AddOn / multiplier / PFE are
+    those of the branch that gives the EAD, so EAD = 1.4 (RC + PFE) always holds; cap is True where
+    the unmargined EAD is the binding one. The raw components of each branch are under "margined"
+    and "unmargined". Once every leg has expired (netting set matured) everything is 0, including
+    the margined RC floor TH + MTA - NICA. With breakdown=True, per-leg and per-entity rows of the
+    binding branch (by the first path) are added."""
     V = np.asarray(V, dtype=float)
     margined = csa.collateralized
     entities: dict[str, list] = {}
@@ -61,7 +85,7 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
     en_u: dict[str, np.ndarray] = {}
     en_m: dict[str, np.ndarray] = {}
     for leg in legs:
-        terms = leg_terms(leg, t, S[leg.underlying], mkt, csa.ccy)
+        terms = leg_terms(leg, t, S[leg.underlying], mkt, csa.ccy, fix)
         if terms is None:
             continue
         ent, is_idx, d, delta, M = terms
@@ -72,10 +96,19 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
         en_m[ent] = en_m.get(ent, 0.0) + delta * d * mf_m
         if breakdown:
             rows.append(dict(trade_id=leg.trade_id, leg_id=leg.leg_id, leg_type=leg.kind,
-                             underlying=ent, adjusted_notional=float(np.mean(d)),
+                             underlying=ent, sa_notional_basis=getattr(leg, "sa_notional_basis", "MARKET"),
+                             adjusted_notional=float(np.mean(d)),
                              supervisory_delta=float(np.mean(delta)), maturity_M=M,
-                             MF=mf_m if margined else mf_u,
-                             effective_notional=float(np.mean(delta * d * (mf_m if margined else mf_u)))))
+                             _mf=(mf_u, mf_m), _en=(float(np.mean(delta * d * mf_u)),
+                                                    float(np.mean(delta * d * mf_m)))))
+
+    zero = np.zeros_like(V)
+    if not entities:              # netting set matured: no exposure, no RC floor
+        comp = dict(RC=zero, AddOn=zero, multiplier=np.ones_like(V), PFE=zero, EAD=zero)
+        res = dict(comp, cap=np.zeros(V.shape, dtype=bool), unmargined=comp, margined=comp)
+        if breakdown:
+            res["legs"], res["entities"] = [], []
+        return res
 
     def addon(en):
         sys_ = 0.0
@@ -84,34 +117,39 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
             a = SF[is_idx] * en[ent]
             sys_ = sys_ + RHO[is_idx] * a
             idio = idio + (1.0 - RHO[is_idx] ** 2) * a * a
-        return np.sqrt(sys_ * sys_ + idio) if entities else np.zeros_like(V)
+        return np.sqrt(sys_ * sys_ + idio) * np.ones_like(V)
 
     def mult(vc, ao):
-        ao = np.asarray(ao, dtype=float) * np.ones_like(vc)
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             m = 0.05 + 0.95 * np.exp(vc / (2.0 * 0.95 * ao))
         return np.where(ao > 0, np.minimum(1.0, m), 1.0)
 
+    def branch(rc, ao, vc):
+        m = mult(vc, ao)
+        return dict(RC=rc, AddOn=ao, multiplier=m, PFE=m * ao, EAD=ALPHA * (rc + m * ao))
+
     nica = csa.nica
-    # unmargined
-    ao_u = addon(en_u) * np.ones_like(V)
     vc_u = V - nica
-    rc_u = np.maximum(vc_u, 0.0)
-    m_u = mult(vc_u, ao_u)
-    ead_u = ALPHA * (rc_u + m_u * ao_u)
+    unm = branch(np.maximum(vc_u, 0.0), addon(en_u), vc_u)
     if margined:
         vm = vm_balance(V, csa)
-        ao = addon(en_m) * np.ones_like(V)
         vc = V - vm - nica
-        rc = np.maximum(np.maximum(vc, csa.threshold_cp + csa.mta - nica), 0.0)
-        m = mult(vc, ao)
-        ead = np.minimum(ALPHA * (rc + m * ao), ead_u)
+        mar = branch(np.maximum(np.maximum(vc, csa.threshold_cp + csa.mta - nica), 0.0), addon(en_m), vc)
+        cap = unm["EAD"] < mar["EAD"]
+        res = {k: np.where(cap, unm[k], mar[k]) for k in unm}
     else:
-        ao, rc, m, ead = ao_u, rc_u, m_u, ead_u
-    res = dict(RC=rc, AddOn=ao, multiplier=m, PFE=m * ao, EAD=ead)
+        mar, cap = unm, np.zeros(V.shape, dtype=bool)
+        res = dict(unm)
+    res.update(cap=cap, unmargined=unm, margined=mar)
     if breakdown:
+        use_u = (not margined) or bool(cap.flat[0])
+        j = 0 if use_u else 1
+        for r in rows:
+            r["MF"] = r.pop("_mf")[j]
+            r["effective_notional"] = r.pop("_en")[j]
+        en = en_u if use_u else en_m
         res["legs"] = rows
         res["entities"] = [dict(underlying=e, is_index=v[0], SF=SF[v[0]], rho=RHO[v[0]],
-                                entity_addon=float(np.mean(SF[v[0]] * (en_m if margined else en_u)[e])))
+                                entity_addon=float(np.mean(SF[v[0]] * en[e])))
                            for e, v in entities.items()]
     return res

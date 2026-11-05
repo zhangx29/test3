@@ -23,7 +23,13 @@ def to_date(x) -> date:
         return x.to_pydatetime().date()
     if isinstance(x, (int, float)) and not isinstance(x, bool):  # Excel serial
         return date(1899, 12, 30) + timedelta(days=int(x))
-    return datetime.strptime(str(x).strip()[:10], "%Y-%m-%d").date()
+    s = str(x).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):  # ISO, or US M/D/YYYY text typed in Excel
+        try:
+            return datetime.strptime(s[:10] if fmt == "%Y-%m-%d" else s, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(f"Unrecognised date '{s}' (expected YYYY-MM-DD, M/D/YYYY or a tenor like 1Y)")
 
 
 def is_tenor(x) -> bool:

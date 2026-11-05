@@ -49,6 +49,9 @@ class TRSLeg:
     has_reset: bool = False
     maturity_date: date | None = None
     reset_freq: str | None = None
+    sa_notional_basis: str = "MARKET"   # SA-CCR adjusted notional: MARKET = shares*S_t, STRIKE = shares*ref
+    sa_ref_price: float | None = None   # STRIKE basis price fixed for the whole life (blend & extend w/ resets)
+    notional_basis: str = "CURRENT"     # CURRENT, AVERAGE or BLEND_EXTEND (output label)
     kind: str = "TRS"
 
     @property
@@ -61,6 +64,17 @@ class TRSLeg:
             if p.end > t + 1e-12:
                 return p.end
         return self.maturity
+
+    def strike_ref(self, t: float) -> tuple[float | None, float | None]:
+        """(fixed reference price, path fixing time) of the period in force at t, else of the next
+        period. Exactly one is not None, except for a not-yet-started period that fixes on the path
+        (both None)."""
+        for p in self.periods:
+            if p.end > t + 1e-12:
+                if p.ref_price is not None:
+                    return p.ref_price, None
+                return (None, p.start) if p.start <= t + 1e-12 else (None, None)
+        return None, None
 
     def fixing_time(self, t: float) -> float | None:
         """Start time of the period in force at t if its notional fixes on the path (start > 0)."""
@@ -155,6 +169,9 @@ class RunConfig:
     antithetic: bool = True
     epe_horizon: str = "1Y"
     analytic_nodes: int = 201
+    # Extra per-netting-set output buckets at trade event dates: NONE (standard buckets only),
+    # MATURITY (each trade's maturity / option expiry), ALL (also TRS equity reset dates).
+    event_buckets: str = "NONE"
 
     def bucket_times(self) -> np.ndarray:
         return np.array([dt.yf(self.valuation_date, d) for d in self.buckets])
@@ -185,8 +202,16 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
         reset = None
     ffreq = "3M" if _is_blank(row.get("funding_reset_freq")) else str(row["funding_reset_freq"]).strip().upper()
     basis = str(row.get("notional_basis") or "CURRENT").strip().upper()
+    blend = basis in ("BLEND_EXTEND", "BLEND_AND_EXTEND", "B&E")
+    if blend:
+        basis = "AVERAGE"          # blend & extend: previous strike in avg_price
+    # Blend & extend with equity resets: every period is struck at market (the first at the pre-shock
+    # spot), and the extension MTM shares*(S_pre - prev_strike) is deferred to the new maturity,
+    # accreting at OIS. Without resets the single period is simply struck at the previous strike
+    # (same as AVERAGE), which already carries the MTM to maturity.
+    blend_reset = blend and reset is not None
     if basis not in ("CURRENT", "AVERAGE"):
-        raise ValueError(f"{row['trade_id']}: notional_basis must be CURRENT or AVERAGE")
+        raise ValueError(f"{row['trade_id']}: notional_basis must be CURRENT, AVERAGE or BLEND_EXTEND")
     if basis == "AVERAGE" and _is_blank(row.get("avg_price")):
         raise ValueError(f"{row['trade_id']}: avg_price is required when notional_basis = AVERAGE")
     shares = float(row["shares"])
@@ -196,13 +221,23 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
     dp = _f(row.get("div_passthrough"), 1.0)
     im = _f(row.get("initial_mtm"))
 
-    ref0 = und.spot if basis == "CURRENT" else float(row["avg_price"])
+    # CURRENT: struck at the pre-shock spot, so a spot_shock leaves the trade off-market
+    prev = None if basis == "CURRENT" else float(row["avg_price"])
+    ref0 = und.trade_spot if (basis == "CURRENT" or blend_reset) else prev
+    period_basis = "CURRENT" if blend_reset else basis
+    sab = "" if _is_blank(row.get("sa_notional_basis")) else str(row["sa_notional_basis"]).strip().upper()
+    sab = sab or ("STRIKE" if basis == "AVERAGE" else "MARKET")
+    if sab not in ("MARKET", "STRIKE"):
+        raise ValueError(f"{row['trade_id']}: sa_notional_basis must be MARKET or STRIKE")
     if basis == "AVERAGE" and im != 0.0:
+        carried = omega * shares * (und.trade_spot if blend_reset else und.spot) - omega * shares * prev
         warnings.append(
-            f"{row['trade_id']}: initial_mtm={im:,.2f} ignored - with notional_basis=AVERAGE the "
-            f"carried MTM is already in the strike (shares*(S0-avg_price)="
-            f"{omega * shares * (und.spot - ref0):,.2f}).")
+            f"{row['trade_id']}: initial_mtm={im:,.2f} ignored - with notional_basis="
+            f"{'BLEND_EXTEND' if blend else 'AVERAGE'} the carried MTM comes from avg_price "
+            f"(shares*(S0-avg_price)={carried:,.2f}).")
         im = 0.0
+    if blend_reset:
+        im = omega * shares * (und.trade_spot - prev)      # deferred extension MTM, paid at maturity
 
     curve = mkt.curve_for(und.ccy)
     eq_dates = dt.schedule(start, mat, reset)
@@ -216,7 +251,7 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
         if in_force or not periods:
             # first live period: notional from the notional basis (current spot or average price);
             # a forward-starting CURRENT trade fixes on the path at its start date
-            ref = ref0 if (in_force or basis == "AVERAGE") else None
+            ref = ref0 if (in_force or period_basis == "AVERAGE") else None
         else:
             ref = None
         fund = []
@@ -234,8 +269,9 @@ def build_trs(row: dict, mkt: MarketData, warnings: list[str]) -> TRSLeg:
     return TRSLeg(
         trade_id=str(row["trade_id"]), leg_id=str(row.get("leg_id", "")), underlying=und.name,
         omega=omega, shares=shares, maturity=dt.yf(val, mat), periods=periods, spread=spread,
-        div_passthrough=dp, initial_mtm=im, im_settle=periods[0].end, has_reset=reset is not None,
-        maturity_date=mat, reset_freq=reset)
+        div_passthrough=dp, initial_mtm=im, im_settle=dt.yf(val, mat) if blend_reset else periods[0].end,
+        has_reset=reset is not None, maturity_date=mat, reset_freq=reset, sa_notional_basis=sab,
+        sa_ref_price=prev if blend_reset else None, notional_basis="BLEND_EXTEND" if blend else basis)
 
 
 MIN_STRIKE_RATIO = 0.2   # strike / spot below this is almost certainly an input error
@@ -252,14 +288,17 @@ def build_option(row: dict, mkt: MarketData, warnings: list[str] | None = None) 
         raise ValueError(f"{row['trade_id']}: option maturity {exp} is not after valuation date")
     k = row["strike"]
     if isinstance(k, str) and k.strip().endswith("%"):
-        strike = und.spot * float(k.strip()[:-1]) / 100.0
+        strike = und.trade_spot * float(k.strip()[:-1]) / 100.0     # % of the pre-shock spot
     else:
         strike = float(k)
-    if warnings is not None and strike < MIN_STRIKE_RATIO * und.spot:
+    if warnings is not None and strike < MIN_STRIKE_RATIO * und.trade_spot:
         warnings.append(
-            f"{row['trade_id']}: strike {strike:,.4f} is only {strike / und.spot:.2%} of spot "
-            f"{und.spot:,.4f} - check the input. A moneyness must be entered as text, e.g. '111.21%' "
+            f"{row['trade_id']}: strike {strike:,.4f} is only {strike / und.trade_spot:.2%} of spot "
+            f"{und.trade_spot:,.4f} - check the input. A moneyness must be entered as text, e.g. '111.21%' "
             f"(Excel stores 111.21% typed into a number cell as 1.1121).")
+    if warnings is not None and not _is_blank(row.get("sa_notional_basis")) and             str(row["sa_notional_basis"]).strip().upper() != "MARKET":
+        warnings.append(f"{row['trade_id']}: sa_notional_basis applies to TRS legs only - option "
+                        f"leg {row.get('leg_id', '')} uses shares x current price.")
     direction = str(row["direction"]).strip().upper()
     sign = {"BUY": 1.0, "LONG": 1.0, "SELL": -1.0, "SHORT": -1.0}[direction]
     otype = str(row["option_type"]).strip().upper()
@@ -271,6 +310,22 @@ def build_option(row: dict, mkt: MarketData, warnings: list[str] | None = None) 
         trade_id=str(row["trade_id"]), leg_id=str(row.get("leg_id", "")), underlying=und.name,
         sign=sign, is_call=otype in ("CALL", "C"), shares=float(row["shares"]), strike=strike,
         expiry_t=dt.yf(val, exp), expiry_date=exp, vol_override=vo, ovme_price=ovme)
+
+
+def parse_shock(x, what: str) -> float:
+    """Relative spot shock: 0.5, '50%' or '+50%' -> 0.5; blank -> 0."""
+    if _is_blank(x):
+        return 0.0
+    if isinstance(x, str):
+        s = x.strip().replace("+", "")
+        v = float(s[:-1]) / 100.0 if s.endswith("%") else float(s)
+    else:
+        v = float(x)
+    if v <= -1.0:
+        raise ValueError(f"{what}: spot_shock {x} would make the spot zero or negative")
+    if v > 10.0:
+        raise ValueError(f"{what}: spot_shock {x} is over +1000% - enter a shock as 50% or 0.5, not 50")
+    return v
 
 
 def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketData,
@@ -290,6 +345,7 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
         sets[ns_id] = NettingSet(ns_id, str(r.get("counterparty") or ""), csa)
 
     trades: dict[str, Trade] = {}
+    shocks: dict[str, float] = {}
     for i, r in enumerate(trade_rows):
         if _is_blank(r.get("trade_id")):
             continue
@@ -299,8 +355,20 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
         if _is_blank(r.get("leg_id")):
             r["leg_id"] = f"L{i + 1}"
         ns_id = str(r.get("netting_set") or r["trade_id"]).strip()
-        if r["underlying"] not in mkt.underlyings:
+        r["underlying"] = str(r["underlying"]).strip()
+        if r["underlying"] not in mkt.underlyings or mkt.underlyings[r["underlying"]].parent:
             raise ValueError(f"{r['trade_id']}: underlying '{r['underlying']}' not in market data")
+        # trade-level instantaneous shock: the trade was struck at the current spot, then the spot moved
+        shock = parse_shock(r.get("spot_shock"), f"{r['trade_id']} {r['leg_id']}")
+        if abs(shocks.setdefault(r["trade_id"], shock) - shock) > 1e-12:
+            raise ValueError(f"{r['trade_id']}: all legs of a trade need the same spot_shock")
+        if shock:
+            base = mkt.underlyings[r["underlying"]]
+            r["underlying"] = mkt.shocked(r["underlying"], shock)
+            msg = (f"{r['trade_id']}: spot shocked {shock:+.2%} after inception ({base.name} "
+                   f"{base.spot:,.4f} -> {base.spot * (1 + shock):,.4f}); trade terms at the current spot.")
+            if msg not in warnings:
+                warnings.append(msg)
         lt = str(r["leg_type"]).strip().upper()
         leg = build_trs(r, mkt, warnings) if lt == "TRS" else build_option(r, mkt, warnings) if lt == "OPTION" else None
         if leg is None:

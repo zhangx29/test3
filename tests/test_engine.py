@@ -258,9 +258,64 @@ def test_saccr_margined_rc_floor_and_mf():
     (ns,), _ = build([trs(maturity="2Y")], mkt,
                      [dict(netting_set="NS", collateralized="Y", threshold_cp=20000, mta=5000,
                            ia_received=3000, mpor_days=10)])
-    r = saccr(ns.legs, 0.0, {"ABC": np.array([100.0])}, np.array([0.0]), ns.csa, mkt)
+    r = saccr(ns.legs, 0.0, {"ABC": np.array([100.0])}, np.array([0.0]), ns.csa, mkt)["margined"]
     assert r["RC"][0] == pytest.approx(20000 + 5000 - 3000)
     assert r["AddOn"][0] == pytest.approx(0.32 * 1e5 * 1.5 * np.sqrt(10 / 250))
+
+
+HIGH_TH_CSA = [dict(netting_set="NS", collateralized="Y", threshold_cp=8e6, threshold_bank=1e15, mta=4e5,
+                    mpor_days=10)]
+
+
+def test_saccr_zero_after_netting_set_matures():
+    mkt = market()
+    (ns,), _ = build([opt(expiry="4M")], mkt, HIGH_TH_CSA)
+    t = ns.legs[0].expiry_t
+    S = {"ABC": np.array([100.0, 130.0])}
+    for tt in (t, t + 0.1):
+        r = saccr(ns.legs, tt, S, np.zeros(2), ns.csa, mkt, breakdown=True)
+        for k in ("RC", "AddOn", "PFE", "EAD"):
+            assert np.all(r[k] == 0.0), (tt, k)
+        assert r["legs"] == [] and r["entities"] == []
+    live = saccr(ns.legs, t - 0.01, S, np.zeros(2), ns.csa, mkt)
+    assert np.all(live["margined"]["RC"] == pytest.approx(8e6 + 4e5))    # floor applies while live
+
+
+def test_saccr_cap_reports_binding_branch_components():
+    mkt = market()
+    (ns,), _ = build([opt(shares=1e5, expiry="6M")], mkt, HIGH_TH_CSA)   # TH + MTA >> exposure: cap binds
+    v0 = leg_mtm0(ns.legs[0], mkt)
+    r = saccr(ns.legs, 0.0, {"ABC": np.array([100.0])}, np.array([v0]), ns.csa, mkt, breakdown=True)
+    assert bool(r["cap"][0])
+    assert r["EAD"][0] == pytest.approx(r["unmargined"]["EAD"][0])
+    assert r["EAD"][0] < r["margined"]["EAD"][0]
+    assert r["RC"][0] == pytest.approx(v0) and r["AddOn"][0] == pytest.approx(r["unmargined"]["AddOn"][0])
+    assert r["EAD"][0] == pytest.approx(1.4 * (r["RC"][0] + r["multiplier"][0] * r["AddOn"][0]))
+    assert r["entities"][0]["entity_addon"] == pytest.approx(r["unmargined"]["AddOn"][0])
+    assert r["legs"][0]["MF"] == pytest.approx(np.sqrt(ns.legs[0].expiry_t))
+    res = run_monte_carlo([ns], mkt, cfg(buckets="1M,3M,6M", mode="AVERAGE", n=2000))
+    sm, p = res.summary.iloc[0], res.ns_profile
+    assert sm.SACCR_basis0 == "UNMARGINED_CAP"
+    assert sm.SACCR_EAD0 == pytest.approx(1.4 * (sm.SACCR_RC0 + sm.SACCR_PFE0))
+    assert np.allclose(p.SACCR_EAD_mean, 1.4 * (p.SACCR_RC_mean + p.SACCR_PFE_mean), rtol=1e-10)
+    assert (p.SACCR_cap_share[:-1] > 0.5).all()
+
+
+def test_saccr_time_averaged_ead_in_average_mode():
+    mkt = market()
+    nss, _ = build([opt(expiry="4M")], mkt, HIGH_TH_CSA)
+    c = cfg(buckets="1M,6M,9M", mode="AVERAGE", n=2000)
+    c.event_buckets = "MATURITY"
+    p = run_monte_carlo(nss, mkt, c).ns_profile.reset_index(drop=True)
+    assert list(p.bucket_type) == ["STANDARD", "EVENT", "STANDARD", "STANDARD"]
+    e = p.iloc[1]                                   # bucket ending on the expiry date
+    assert e.SACCR_EAD_mean == 0.0 and e.SACCR_RC_mean == 0.0     # point value on expiry: matured
+    assert e.SACCR_EAD_avg > 0.0                    # but the trade was live through the bucket
+    assert p.SACCR_EAD_avg.iloc[2:].eq(0.0).all()
+    assert p.SACCR_EAD_avg[0] == pytest.approx(p.SACCR_EAD_mean[0], rel=0.25)
+    pt = cfg(buckets="1M,6M,9M", mode="POINT", n=2000)
+    q = run_monte_carlo(nss, mkt, pt).ns_profile
+    assert np.allclose(q.SACCR_EAD_avg, q.SACCR_EAD_mean)
 
 
 # ----------------------------------------------------------------------------- buckets / input guards
@@ -279,6 +334,82 @@ def test_average_bucket_straddling_maturity_uses_full_width():
     assert ee6m < 0.5 * res.ns_profile.EE.iloc[0]     # ~1 month live out of a 3-month bucket
 
 
+def _area(prof):
+    """Sum of bucket value x bucket width per netting set (the integral a CVA/FVA engine sees)."""
+    w = prof.groupby("netting_set").t.diff().fillna(prof.t)
+    return (prof.EE * w).groupby(prof.netting_set).sum(), (prof.FCA_exposure * w).groupby(prof.netting_set).sum()
+
+
+def test_event_buckets_maturity_adds_expiry_and_keeps_area():
+    mkt = market()
+    rows = [opt(tid="O", ns="NS_OPT", expiry="4M"), trs(tid="T", ns="NS_TRS", maturity="1Y", reset="3M")]
+    nss, _ = build(rows, mkt)
+    base = cfg(buckets="3M,6M,9M,1Y", mode="AVERAGE", n=4000)
+    ev = cfg(buckets="3M,6M,9M,1Y", mode="AVERAGE", n=4000)
+    ev.event_buckets = "MATURITY"
+    r0, r1 = run_monte_carlo(nss, mkt, base), run_monte_carlo(nss, mkt, ev)
+    p0, p1 = r0.ns_profile, r1.ns_profile
+    o = p1[p1.netting_set == "NS_OPT"].reset_index(drop=True)
+    exp_date = dt.add_tenor(VAL, "4M")
+    assert list(o.bucket_type) == ["STANDARD", "EVENT", "STANDARD", "STANDARD", "STANDARD"]
+    assert o.bucket_date[1] == exp_date and o.bucket_start[2] == exp_date
+    assert o.EE[1] > 0 and o.EE[2] == 0.0            # nothing after expiry once the expiry is a bucket
+    # TRS maturity is already a standard bucket: nothing added; other netting set unaffected
+    assert (p1.netting_set == "NS_TRS").sum() == 4
+    pd.testing.assert_frame_equal(p1[p1.netting_set == "NS_TRS"].reset_index(drop=True),
+                                  p0[p0.netting_set == "NS_TRS"].reset_index(drop=True))
+    # area under every profile unchanged (same simulation grid, so equal to rounding)
+    for a0, a1 in zip(_area(p0), _area(p1)):
+        assert np.allclose(a0.sort_index(), a1.sort_index(), rtol=1e-12, atol=1e-9)
+    # trade-level output gets the same buckets
+    assert (r1.trade_profile.trade_id == "O").sum() == 5
+
+
+def test_event_buckets_all_adds_trs_resets():
+    mkt = market()
+    nss, _ = build([trs(maturity="1Y", reset="3M")], mkt)
+    c = cfg(buckets="2M,1Y", mode="AVERAGE", n=2000)
+    c.event_buckets = "ALL"
+    p = run_monte_carlo(nss, mkt, c).ns_profile
+    added = sorted(p[p.bucket_type == "EVENT"].bucket_date)
+    assert added == [dt.add_tenor(VAL, t) for t in ("3M", "6M", "9M")]
+
+
+def test_event_buckets_point_mode_uses_day_before_event():
+    mkt = market()
+    nss, _ = build([opt(expiry="4M")], mkt)
+    c = cfg(buckets="3M,6M", mode="POINT", n=2000)
+    c.event_buckets = "MATURITY"
+    p = run_monte_carlo(nss, mkt, c).ns_profile
+    e = p[p.bucket_type == "EVENT"].iloc[0]
+    assert e.bucket_date == dt.add_tenor(VAL, "4M") - dt.timedelta(days=1)
+    assert e.EE > 0
+
+
+@pytest.mark.parametrize("mode", ["AVERAGE", "POINT"])
+def test_zero_day_bucket_reports_valuation_date_values(mode):
+    mkt = market()
+    nss, _ = build([opt(expiry="4M")], mkt)
+    c = cfg(buckets="0D,1M,6M", mode=mode, n=2000)
+    c.event_buckets = "MATURITY"
+    res = run_monte_carlo(nss, mkt, c)
+    p = res.ns_profile.reset_index(drop=True)
+    assert p.bucket_date[0] == VAL and p.t[0] == 0.0 and p.bucket_type[0] == "STANDARD"
+    v0 = leg_mtm0(nss[0].legs[0], mkt)
+    assert p.EE[0] == pytest.approx(v0, rel=1e-9) and p.MTM[0] == pytest.approx(v0, rel=1e-9)
+    assert p.SACCR_EAD_mean[0] == pytest.approx(res.summary.SACCR_EAD0[0], rel=1e-9)
+    assert p.SACCR_EAD_avg[0] == pytest.approx(res.summary.SACCR_EAD0[0], rel=1e-9)
+    assert p.bucket_start[1] == VAL and len(p) == 4
+
+
+def test_event_buckets_bad_value_rejected():
+    sheets = ccy_sheets()
+    sheets["Config"] = pd.concat([sheets["Config"], pd.DataFrame([("event_buckets", "RESETS")],
+                                                                  columns=["key", "value"])])
+    with pytest.raises(ValueError, match="event_buckets"):
+        parse_inputs(sheets)
+
+
 @pytest.mark.parametrize("strike, warns", [(1.1121, True), ("11.21%", True), (75.0, False), ("111.21%", False)])
 def test_strike_far_below_spot_warns(strike, warns):
     mkt = market(spot=67.44)
@@ -293,7 +424,8 @@ from eqxva.examples import NS_COLUMNS, TRADE_COLUMNS  # noqa: E402
 from eqxva.io_excel import parse_fx, parse_inputs  # noqa: E402
 
 AMOUNTS = ["MTM", "EE", "NEE", "PFE", "NPFE", "EE_uncoll", "NEE_uncoll", "PFE_uncoll", "FCA_exposure",
-           "FBA_exposure", "SACCR_EAD_mean", "SACCR_RC_mean", "SACCR_AddOn_mean", "SACCR_EAD_fwd"]
+           "FBA_exposure", "SACCR_EAD_mean", "SACCR_RC_mean", "SACCR_AddOn_mean", "SACCR_EAD_fwd",
+           "SACCR_PFE_mean", "SACCR_EAD_avg"]
 
 
 def ccy_sheets(reporting="USD", usdcad=1.40, extra_trades=(), csa_ccy="CAD"):
@@ -370,3 +502,170 @@ def test_missing_fx_or_curve_or_reporting_ccy_raises():
     s = ccy_sheets("")
     with pytest.raises(ValueError, match="reporting_ccy"):
         parse_inputs(s)
+
+
+# ----------------------------------------------------------------------------- off-market start
+def shocked_market(shock=0.5, spot=100.0, r=0.04, q=0.02, vol=None):
+    surf = vol or VolSurface.flat(0.3)
+    u = Underlying("ABC", spot * (1 + shock), q, False, surf, ref_spot=spot)
+    return MarketData(VAL, ZeroCurve.flat(r), {"ABC": u})
+
+
+def test_spot_shock_trs_struck_at_pre_shock_spot():
+    m0, m1 = market(), shocked_market(0.5)
+    (ns0,), _ = build([trs(maturity="2Y")], m0)
+    (ns1,), _ = build([trs(maturity="2Y")], m1)
+    leg = ns1.legs[0]
+    assert leg.periods[0].ref_price == 100.0                      # notional at the pre-shock spot
+    assert leg_mtm0(ns0.legs[0], m0) == pytest.approx(0.0, abs=1e-6)
+    # MTM = value of the same contract at the shocked spot
+    expected = trs_value(ns0.legs[0], 0.0, np.array([150.0]), m0, np.array([150.0]))[0]
+    assert leg_mtm0(leg, m1) == pytest.approx(expected, rel=1e-12)
+    assert leg_mtm0(leg, m1) > 0.45 * 1000 * 100                  # ~ shares * 50 * e^{-q T}
+    r = saccr(ns1.legs, 0.0, {"ABC": np.array([150.0])}, np.array([leg_mtm0(leg, m1)]), ns1.csa, m1,
+              breakdown=True)
+    assert r["legs"][0]["adjusted_notional"] == pytest.approx(1000 * 150.0)   # SA notional at shocked spot
+    assert r["legs"][0]["sa_notional_basis"] == "MARKET"
+
+
+def test_spot_shock_option_pct_strike_and_sticky_strike_vol():
+    smile = VolSurface(np.array([1.0]), np.array([0.8, 1.0, 1.5]), np.array([[0.35, 0.30, 0.22]]))
+    m1 = shocked_market(0.5, vol=smile)
+    (ns,), _ = build([opt(strike="100%", expiry="1Y")], m1)
+    leg = ns.legs[0]
+    assert leg.strike == pytest.approx(100.0)                      # % of the pre-shock spot
+    df = float(m1.curve.df(leg.expiry_t))
+    px = bs_price(150.0, 100.0, leg.expiry_t, df, 0.02, 0.30, True)  # vol of the K=100 strike (sticky)
+    assert leg_mtm0(leg, m1) == pytest.approx(1000 * px, rel=1e-10)
+    assert float(m1.underlyings["ABC"].atm_vol(1.0)) == pytest.approx(0.22)   # simulation: vol at new ATM
+    S = run_monte_carlo([ns], m1, cfg(buckets="1M", n=2000)).leg_mtm
+    assert S.spot[0] == 150.0 and S.trade_spot[0] == 100.0
+
+
+def test_trade_level_spot_shock_alongside_unshocked_copy():
+    sheets = ccy_sheets(csa_ccy="USD")
+    base = sheets["Trades"].iloc[0].to_dict()
+    up = dict(base, trade_id="C_UP", netting_set="NS_UP", spot_shock="50%")
+    sheets["Trades"] = pd.DataFrame([base, up], columns=TRADE_COLUMNS)
+    sheets["NettingSets"] = pd.DataFrame([dict(netting_set=n, collateralized="N") for n in ("NS", "NS_UP")],
+                                         columns=NS_COLUMNS)
+    mkt, nss, c, w = parse_inputs(sheets)
+    assert mkt.underlyings["TOU"].spot == 67.44 and mkt.underlyings["TOU"].ref_spot is None   # market untouched
+    leg0, leg1 = nss[0].legs[0], nss[1].legs[0]
+    assert leg0.underlying == "TOU" and leg1.underlying == "TOU+50%"
+    u = mkt.underlyings["TOU+50%"]
+    assert u.spot == pytest.approx(67.44 * 1.5) and u.trade_spot == 67.44 and u.root == "TOU"
+    assert leg1.strike == 75.0 and any("C_UP: spot shocked +50.00%" in x for x in w)
+    res = run_monte_carlo(nss, mkt, c, w)
+    lm = res.leg_mtm.set_index("trade_id")
+    assert lm.loc["C_UP", "spot_shock"] == 0.5 and lm.loc["C", "spot_shock"] == 0.0
+    assert lm.loc["C_UP", "mtm0"] > 3 * lm.loc["C", "mtm0"]
+    # same random numbers: with a flat vol the shocked paths are the market paths x 1.5
+    from eqxva.exposure import build_grid
+    from eqxva.simulation import simulate
+    grid = build_grid(nss, c)
+    S = simulate(mkt, ["TOU", "TOU+50%"], grid, 200, 3)
+    assert np.allclose(S["TOU+50%"], 1.5 * S["TOU"])
+    # unshocked netting set identical to a run without the shocked copy
+    alone = run_monte_carlo([nss[0]], mkt, c, w).ns_profile
+    pd.testing.assert_frame_equal(alone.reset_index(drop=True),
+                                  res.ns_profile[res.ns_profile.netting_set == "NS"].reset_index(drop=True))
+    # SA-CCR: the shocked copy is the same entity as its market underlying
+    assert set(res.saccr_entities.underlying) == {"TOU"}
+
+
+def test_trade_level_spot_shock_validation():
+    mkt = market()
+    with pytest.raises(ValueError, match="same spot_shock"):
+        build([dict(opt(), leg_id="L1", spot_shock=0.5), dict(opt(), leg_id="L2", spot_shock=0.2)], mkt)
+    with pytest.raises(ValueError, match="not 50"):
+        build([dict(opt(), spot_shock=50)], mkt)
+    with pytest.raises(ValueError, match="not in market data"):
+        build([dict(opt(), underlying="ABC+50%")], mkt)
+
+
+def test_blend_extend_sa_notional_uses_previous_strike():
+    mkt = market()
+    (ns,), w = build([trs(basis="BLEND_EXTEND", avg=90.0, maturity="2Y")], mkt)
+    leg = ns.legs[0]
+    assert leg.sa_notional_basis == "STRIKE" and leg.periods[0].ref_price == 90.0
+    assert leg_mtm0(leg, mkt) > 0.9 * 1000 * 10                     # extension MTM carried in the strike
+    r = saccr(ns.legs, 0.0, {"ABC": np.array([100.0])}, np.array([0.0]), ns.csa, mkt, breakdown=True)
+    assert r["legs"][0]["adjusted_notional"] == pytest.approx(1000 * 90.0)
+    assert r["AddOn"][0] == pytest.approx(0.32 * 1000 * 90.0)
+    # explicit MARKET override -> shares * current price
+    (nsm,), _ = build([dict(trs(basis="AVERAGE", avg=90.0), sa_notional_basis="MARKET")], mkt)
+    rm = saccr(nsm.legs, 0.0, {"ABC": np.array([100.0])}, np.array([0.0]), nsm.csa, mkt)
+    assert rm["AddOn"][0] == pytest.approx(0.32 * 1000 * 100.0)
+    # combined with a spot shock: still the previous strike, MTM at the shocked spot
+    m1 = shocked_market(0.5)
+    (nss,), _ = build([trs(basis="AVERAGE", avg=90.0, maturity="2Y")], m1)
+    rs = saccr(nss.legs, 0.0, {"ABC": np.array([150.0])}, np.array([0.0]), nss.csa, m1, breakdown=True)
+    assert rs["legs"][0]["adjusted_notional"] == pytest.approx(1000 * 90.0)
+
+
+def test_blend_extend_with_reset_uses_reset_price_after_reset():
+    mkt = market()
+    (ns,), _ = build([trs(basis="AVERAGE", avg=90.0, reset="3M", maturity="1Y")], mkt)
+    leg = ns.legs[0]
+    t1 = leg.periods[1].start
+    S = {"ABC": np.array([100.0, 120.0])}
+    r0 = saccr(ns.legs, t1 / 2, S, np.zeros(2), ns.csa, mkt)
+    assert np.allclose(r0["unmargined"]["AddOn"] / 0.32 / 1000 / np.sqrt(leg.periods[0].end - t1 / 2), 90.0)
+    fixings = np.array([95.0, 130.0])
+    r1 = saccr(ns.legs, t1 + 0.05, S, np.zeros(2), ns.csa, mkt, fix=lambda u, tf: fixings)
+    M = leg.periods[1].end - (t1 + 0.05)
+    assert np.allclose(r1["AddOn"], 0.32 * 1000 * fixings * np.sqrt(max(M, 10 / 250)))
+    res = run_monte_carlo([ns], mkt, cfg(buckets="1M,4M,7M,1Y", n=2000))     # engine wiring
+    assert (res.ns_profile.SACCR_EAD_mean.iloc[:3] > 0).all()
+
+
+def test_sa_notional_basis_on_option_warns():
+    mkt = market()
+    _, w = build([dict(opt(), sa_notional_basis="STRIKE")], mkt)
+    assert any("sa_notional_basis applies to TRS" in x for x in w)
+
+
+def test_blend_extend_with_reset_defers_mtm_to_maturity():
+    mkt = market()
+    (ns,), w = build([trs(basis="BLEND_EXTEND", avg=90.0, reset="3M", maturity="1Y")], mkt)
+    leg = ns.legs[0]
+    assert leg.notional_basis == "BLEND_EXTEND" and leg.sa_notional_basis == "STRIKE"
+    assert leg.periods[0].ref_price == 100.0                       # struck at market
+    assert all(p.ref_price is None for p in leg.periods[1:])       # later periods re-fix on the path
+    assert leg.initial_mtm == pytest.approx(1000 * (100.0 - 90.0))  # deferred extension MTM
+    assert leg.im_settle == pytest.approx(leg.maturity)
+    assert not any("ignored" in x for x in w)
+    # MTM0 ~ value of the AVERAGE (settle at first reset) version: both carry shares*(S0 - prev)
+    (na,), _ = build([trs(basis="AVERAGE", avg=90.0, reset="3M", maturity="1Y")], mkt)
+    assert leg_mtm0(leg, mkt) == pytest.approx(leg_mtm0(na.legs[0], mkt), rel=0.01)
+    # just after the first reset the deferred MTM is still owed (accreted); AVERAGE has settled it
+    t = leg.periods[0].end + 1e-4
+    S = np.array([100.0])
+    v_be = trs_value(leg, t, S, mkt, S)[0]
+    v_av = trs_value(na.legs[0], t, S, mkt, S)[0]
+    assert v_be == pytest.approx(10000.0 * np.exp(0.04 * t), rel=1e-3) and abs(v_av) < 50.0
+    # paid at maturity: nothing left after
+    assert trs_value(leg, leg.maturity, S, mkt, S)[0] == 0.0
+    # SA notional = shares * previous strike for life, also after resets
+    r = saccr(ns.legs, t, {"ABC": np.array([100.0, 130.0])}, np.zeros(2), ns.csa, mkt,
+              fix=lambda u, tf: np.array([95.0, 125.0]), breakdown=True)
+    assert r["legs"][0]["adjusted_notional"] == pytest.approx(1000 * 90.0)
+    # engine: exposure persists to maturity
+    res = run_monte_carlo([ns], mkt, cfg(buckets="1M,4M,7M,11M", n=4000))
+    lm = res.leg_mtm.iloc[0]
+    assert lm.carried_mtm == pytest.approx(10000.0) and lm.carried_mtm_settle == leg.maturity_date
+    assert (res.ns_profile.EE > 9000).all()
+
+
+def test_blend_extend_with_reset_under_shock_and_user_initial_mtm():
+    m1 = shocked_market(0.5)
+    (ns,), w = build([trs(basis="BLEND_EXTEND", avg=90.0, reset="3M", im=5000.0)], m1)
+    leg = ns.legs[0]
+    assert any("initial_mtm=5,000.00 ignored" in x for x in w)
+    assert leg.periods[0].ref_price == 100.0                       # pre-shock spot
+    assert leg.initial_mtm == pytest.approx(1000 * (100.0 - 90.0))  # extension MTM at the pre-shock spot
+    assert leg_mtm0(leg, m1) > 1000 * (150.0 - 90.0) * 0.97         # shock move on top, in the live period
+    # no-reset blend & extend unchanged: single period struck at the previous strike
+    (n2,), _ = build([trs(basis="BLEND_EXTEND", avg=90.0)], m1)
+    assert n2.legs[0].periods[0].ref_price == 90.0 and n2.legs[0].initial_mtm == 0.0
