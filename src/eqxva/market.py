@@ -110,6 +110,7 @@ class MarketData:
     reporting_ccy: str = ""        # ``curve`` is this currency's curve
     curves: dict[str, ZeroCurve] = field(default_factory=dict)    # other currencies
     fx_spot: dict[str, float] = field(default_factory=dict)       # reporting-ccy units per 1 unit of ccy
+    commodity: object | None = None    # commodity.market.CommodityModel when futures contracts are present
 
     def curve_for(self, ccy: str) -> ZeroCurve:
         if not ccy or ccy == self.reporting_ccy:

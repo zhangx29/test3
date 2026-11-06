@@ -12,6 +12,7 @@ from datetime import date
 import numpy as np
 
 from . import dates as dt
+from .commodity.swap import build_commodity_swap
 from .market import MarketData
 
 log = logging.getLogger(__name__)
@@ -130,6 +131,7 @@ class CSA:
     mpor_days: int = 10            # business days
     rounding: float = 0.0
     ccy: str = ""                  # CSA currency: thresholds, MTA, IA and netting-set values; blank = reporting
+    sa_alpha: float = 1.4          # SA-CCR alpha for this netting set
 
     @property
     def mpor_years(self) -> float:
@@ -341,7 +343,8 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
                   ia_posted_segregated=str(r.get("ia_posted_segregated") or "Y").strip().upper()
                   in ("Y", "YES", "TRUE", "1"),
                   mpor_days=int(_f(r.get("mpor_days"), 10)), rounding=_f(r.get("rounding")),
-                  ccy="" if _is_blank(r.get("csa_ccy")) else str(r["csa_ccy"]).strip().upper())
+                  ccy="" if _is_blank(r.get("csa_ccy")) else str(r["csa_ccy"]).strip().upper(),
+                  sa_alpha=_f(r.get("sa_alpha"), 1.4))
         sets[ns_id] = NettingSet(ns_id, str(r.get("counterparty") or ""), csa)
 
     trades: dict[str, Trade] = {}
@@ -370,9 +373,12 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
             if msg not in warnings:
                 warnings.append(msg)
         lt = str(r["leg_type"]).strip().upper()
-        leg = build_trs(r, mkt, warnings) if lt == "TRS" else build_option(r, mkt, warnings) if lt == "OPTION" else None
+        if lt == "COMSWAP" and shock:
+            raise ValueError(f"{r['trade_id']}: spot_shock is not supported on COMSWAP legs")
+        leg = (build_trs(r, mkt, warnings) if lt == "TRS" else build_option(r, mkt, warnings) if lt == "OPTION"
+               else build_commodity_swap(r, mkt, warnings) if lt == "COMSWAP" else None)
         if leg is None:
-            raise ValueError(f"{r['trade_id']}: leg_type must be TRS or OPTION")
+            raise ValueError(f"{r['trade_id']}: leg_type must be TRS, OPTION or COMSWAP")
         tr = trades.get(r["trade_id"])
         if tr is None:
             tr = trades[r["trade_id"]] = Trade(r["trade_id"], ns_id)

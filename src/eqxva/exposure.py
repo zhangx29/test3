@@ -14,10 +14,13 @@ import pandas as pd
 
 from . import dates as dt
 from .collateral import collateralised, vm_balance
+from .commodity.market import is_future
+from .commodity.nfactor import simulate_futures
+from .commodity.swap import CommoditySwapLeg, swap_value
 from .market import MarketData
 from .model import NettingSet, OptionLeg, RunConfig, TRSLeg
 from .products import option_value, trs_value
-from .saccr import saccr
+from .saccr import commodity_sf, maturity_factor, saccr
 from .simulation import forward_path, simulate
 
 ONE_DAY = 1.0 / 365.0
@@ -32,6 +35,8 @@ def event_times(netting_sets: list[NettingSet]) -> list[float]:
             if isinstance(leg, TRSLeg):
                 for p in leg.periods:
                     ev += [p.start, p.end]
+            elif isinstance(leg, CommoditySwapLeg):
+                ev.append(leg.fixing_t)
     return [e for e in ev if e > 0]
 
 
@@ -65,6 +70,7 @@ def ns_event_times(ns: NettingSet, mode: str) -> list[float]:
     ev = [leg.expiry for leg in ns.legs]
     if mode == "ALL":
         ev += [p.end for leg in ns.legs if isinstance(leg, TRSLeg) for p in leg.periods]
+        ev += [leg.fixing_t for leg in ns.legs if isinstance(leg, CommoditySwapLeg)]
     return sorted({e for e in ev if e > 0})
 
 
@@ -131,6 +137,9 @@ def leg_value(leg, t: float, i: int, grid, S: dict, mkt: MarketData):
     St = S[leg.underlying][:, i]
     if isinstance(leg, OptionLeg):
         return option_value(leg, t, St, mkt)
+    if isinstance(leg, CommoditySwapLeg):
+        fixed = leg.fixing_t - 1e-12 <= t < leg.payment_t - 1e-12
+        return swap_value(leg, t, St, mkt, S[leg.underlying][:, _idx(grid, leg.fixing_t)] if fixed else None)
     tf = leg.fixing_time(t)
     sfix = S[leg.underlying][:, _idx(grid, tf)] if tf is not None else None
     return trs_value(leg, t, St, mkt, sfix)
@@ -155,6 +164,8 @@ def leg_mtm0(leg, mkt: MarketData) -> float:
     S0 = np.array([mkt.underlyings[leg.underlying].spot])
     if isinstance(leg, OptionLeg):
         return float(option_value(leg, 0.0, S0, mkt)[0])
+    if isinstance(leg, CommoditySwapLeg):
+        return float(swap_value(leg, 0.0, S0, mkt)[0])
     return float(trs_value(leg, 0.0, S0, mkt, S0)[0])
 
 
@@ -178,11 +189,17 @@ class Results:
     grid_profile: pd.DataFrame
     warnings: list[str] = field(default_factory=list)
     analytic: pd.DataFrame | None = None
+    saccr_proxy: pd.DataFrame | None = None
+    exposure_compare: pd.DataFrame | None = None
 
     def tables(self) -> dict[str, pd.DataFrame]:
         out = {"Summary": self.summary, "EE_NEE": self.ns_profile, "TradeExposure": self.trade_profile,
                "LegMTM": self.leg_mtm, "SACCR_Legs": self.saccr_legs, "SACCR_Entities": self.saccr_entities,
                "GridProfile": self.grid_profile}
+        if self.saccr_proxy is not None and len(self.saccr_proxy):
+            out["SACCR_Proxy"] = self.saccr_proxy
+        if self.exposure_compare is not None and len(self.exposure_compare):
+            out["ExposureCompare"] = self.exposure_compare
         if self.analytic is not None:
             out["AnalyticCheck"] = self.analytic
         out["Warnings"] = pd.DataFrame({"warning": self.warnings or ["(none)"]})
@@ -190,12 +207,45 @@ class Results:
 
 
 # ----------------------------------------------------------------------------- engine
+def simulate_all(mkt: MarketData, names: list[str], grid, cfg: RunConfig) -> dict[str, np.ndarray]:
+    """Paths for every underlying: equities by GBM, futures contracts by the N-factor model."""
+    fut = [n for n in names if is_future(mkt, n)]
+    eq = [n for n in names if n not in fut]
+    S = simulate(mkt, eq, grid, cfg.n_paths, cfg.seed, cfg.antithetic) if eq else {}
+    if fut:
+        S.update(simulate_futures(mkt, fut, grid, cfg.n_paths, cfg.seed, cfg.antithetic))
+    return S
+
+
+def sa_proxy_rows(ns: NettingSet, mkt: MarketData, x0: float) -> list[dict]:
+    """Single-line equivalent of each commodity trade at t = 0: the notional that gives the trade's
+    standalone add-on as one position, SA_NOTIONAL = AddOn / (SF * MF). Exact at t = 0 for a
+    standalone trade whose legs share a hedging set, supervisory factor and maturity factor."""
+    rows = []
+    margined = ns.csa.collateralized
+    for tr in ns.trades:
+        if not all(isinstance(l, CommoditySwapLeg) for l in tr.legs):
+            continue
+        S0 = {l.underlying: np.array([mkt.underlyings[l.underlying].spot]) for l in tr.legs}
+        r = saccr(tr.legs, 0.0, S0, np.zeros(1), ns.csa, mkt)
+        ps = [mkt.commodity.products[mkt.underlyings[l.underlying].product] for l in tr.legs]
+        sfs = {commodity_sf(p.commodity_type) for p in ps}
+        mfs = {round(maturity_factor(l.expiry, ns.csa, margined), 12) for l in tr.legs}
+        exact = len(sfs) == 1 and len(mfs) == 1 and len({p.hedging_set for p in ps}) == 1
+        sf, mf = max(sfs), max(mfs)
+        addon = float(r["margined" if margined else "unmargined"]["AddOn"][0]) * x0
+        rows.append(dict(netting_set=ns.netting_set, trade_id=tr.trade_id, SF=sf, MF=mf, AddOn0=addon,
+                         SA_NOTIONAL=addon / (sf * mf) if exact else np.nan,
+                         note="" if exact else "legs differ in hedging set, SF or MF: keep the legs"))
+    return rows
+
+
 def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig,
                     warnings: list[str] | None = None, saccr_paths: int = 2000) -> Results:
     warnings = list(warnings or [])
     grid = build_grid(netting_sets, cfg)
     names = sorted({l.underlying for ns in netting_sets for l in ns.legs})
-    S = simulate(mkt, names, grid, cfg.n_paths, cfg.seed, cfg.antithetic)
+    S = simulate_all(mkt, names, grid, cfg)
     Sfwd = forward_path(mkt, names, grid)
     mode = cfg.output_mode.upper()
     q = cfg.pfe_quantile
@@ -203,6 +253,7 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
     n_sa = min(saccr_paths, cfg.n_paths)
 
     ns_rows, tr_rows, sum_rows, mtm_rows, sl_rows, se_rows, grid_rows = [], [], [], [], [], [], []
+    px_rows = []
     rep = mkt.reporting_ccy
     for ns in netting_sets:
         csa = ns.csa
@@ -237,6 +288,10 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
                     row.update(strike=leg.strike, expiry=leg.expiry_date, engine_px_per_share=px,
                                ovme_px_per_share=leg.ovme_price,
                                diff_vs_ovme=None if leg.ovme_price is None else px - leg.ovme_price)
+                elif isinstance(leg, CommoditySwapLeg):
+                    row.update(maturity=leg.payment_date, fixing_date=leg.fixing_date,
+                               quantity=leg.quantity, fixed_price=leg.fixed_price,
+                               notional0=leg.quantity * und.spot)
                 else:
                     row.update(maturity=leg.maturity_date, reset=leg.reset_freq or "NONE",
                                notional_basis=leg.notional_basis,
@@ -303,6 +358,8 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
             row.update(entity_addon=row["entity_addon"] * x0)
             se_rows.append(dict(netting_set=ns.netting_set, ccy=rep, **row))
 
+        px_rows += sa_proxy_rows(ns, mkt, x0)
+
         bc = {k: bucketise(grid, v, bt, mode) for k, v in st_c.items()}
         bu = {k: bucketise(grid, v, bt, mode) for k, v in st_u.items()}
         bfca, bfba = bucketise(grid, fca, bt, mode), bucketise(grid, fba, bt, mode)
@@ -338,4 +395,4 @@ def run_monte_carlo(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunCon
 
     return Results(pd.DataFrame(ns_rows), pd.DataFrame(tr_rows), pd.DataFrame(sum_rows),
                    pd.DataFrame(mtm_rows), pd.DataFrame(sl_rows), pd.DataFrame(se_rows),
-                   pd.DataFrame(grid_rows), warnings)
+                   pd.DataFrame(grid_rows), warnings, saccr_proxy=pd.DataFrame(px_rows))

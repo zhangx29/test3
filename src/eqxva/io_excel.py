@@ -16,6 +16,9 @@ Blank ccy / csa_ccy / Curve ccy mean the reporting currency.
                notional_basis | avg_price | initial_mtm | div_passthrough |
                option_type | strike | option_maturity | vol_override | ovme_price | sa_notional_basis |
                spot_shock (optional, e.g. 50%: the spot moves by this much right after the trade is struck)
+               COMSWAP legs: underlying = contract, direction BUY/SELL, lots or quantity, fixed_price
+               (blank = at market), fixing_date (blank = contract expiry), payment_date (blank = fixing)
+Commodity sheets (optional; Market is then optional too): see commodity/io.py.
 """
 from __future__ import annotations
 
@@ -28,7 +31,8 @@ from . import dates as dt
 from .market import MarketData, Underlying, VolSurface, ZeroCurve
 from .model import RunConfig, build_netting_sets
 
-INPUT_SHEETS = ["Config", "Market", "Curve", "FX", "VolSurface", "Correlation", "NettingSets", "Trades"]
+INPUT_SHEETS = ["Config", "Market", "Curve", "FX", "VolSurface", "Correlation", "NettingSets", "Trades",
+                "CommodityProducts", "CommodityFactors", "FactorCorrelation", "Contracts"]
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -107,7 +111,7 @@ def parse_inputs(sheets: dict[str, pd.DataFrame]):
     warnings: list[str] = []
     kv = parse_config(sheets["Config"])
     val = dt.to_date(kv["valuation_date"])
-    market_df = _clean(sheets["Market"])
+    market_df = _clean(sheets["Market"]) if sheets.get("Market") is not None else pd.DataFrame()
     curve_df = _clean(sheets["Curve"])
     ns_rows = _records(_clean(sheets["NettingSets"])) if "NettingSets" in sheets else []
 
@@ -163,7 +167,13 @@ def parse_inputs(sheets: dict[str, pd.DataFrame]):
         for r in _records(_clean(sheets["Correlation"])):
             if r.get("underlying1") and r.get("underlying2"):
                 corr[(str(r["underlying1"]).strip(), str(r["underlying2"]).strip())] = float(r["rho"])
-    mkt = MarketData(val, curve, unds, corr, rep, curves, parse_fx(sheets.get("FX"), rep))
+    from .commodity.io import parse_commodity
+    model, contracts = parse_commodity(sheets, val, rep, warnings)
+    clash = sorted(set(unds) & set(contracts))
+    if clash:
+        raise ValueError(f"Names on both Market and Contracts: {', '.join(clash)}")
+    unds.update(contracts)
+    mkt = MarketData(val, curve, unds, corr, rep, curves, parse_fx(sheets.get("FX"), rep), commodity=model)
 
     trade_rows = _records(_clean(sheets["Trades"]))
     nss = build_netting_sets(trade_rows, ns_rows, mkt, warnings)
@@ -196,7 +206,9 @@ def read_workbook(path: str | Path) -> dict[str, pd.DataFrame]:
     for s in INPUT_SHEETS:
         if s in xl.sheet_names:
             out[s] = xl.parse(s, header=0 if s != "Config" else 0)
-    missing = {"Config", "Market", "Curve", "Trades"} - set(out)
+    missing = {"Config", "Curve", "Trades"} - set(out)
+    if "Market" not in out and "Contracts" not in out:
+        missing.add("Market")
     if missing:
         raise ValueError(f"{path}: missing sheets {sorted(missing)}")
     return out

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "eqxva"
 version = "0.1.0"
-description = "Exposure engine (EE/NEE/PFE/funding exposure/SA-CCR) for XVA pricing of equity TRS and European options"
+description = "Exposure engine (EE/NEE/PFE/funding exposure/SA-CCR) for XVA pricing of equity TRS, European options and commodity swaps"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy", "pandas", "openpyxl"]
 

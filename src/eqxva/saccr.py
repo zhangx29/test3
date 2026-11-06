@@ -1,4 +1,4 @@
-"""SA-CCR (BCBS CRE52) for the equity asset class.
+"""SA-CCR (BCBS CRE52) for the equity and commodity asset classes.
 
 EAD = alpha * (RC + PFE), alpha = 1.4
 PFE = multiplier * AddOn,  multiplier = min(1, 0.05 + 0.95 exp((V - C) / (2 * 0.95 * AddOn)))
@@ -11,6 +11,11 @@ MF unmargined = sqrt(min(max(M, 10bd), 1y) / 1y); margined = 1.5 sqrt(MPOR / 1y)
 For transactions that settle outstanding exposure and reset to zero fair value on set dates
 (reset TRS), M is the time to the next reset date (CRE52.37(5)); MF floor of 10 business days
 per CRE52.48.
+AddOn_commodity = sum over hedging sets (no offset between them) of
+  sqrt((rho sum_k A_k)^2 + (1 - rho^2) sum_k A_k^2),  A_k = SF_k * sum_i delta_i d_i MF_i per commodity
+  type, rho 40%, SF 18% (40% electricity). Long and short positions in one commodity type offset
+  fully. Asset-class add-ons are summed. A leg that has fixed but not paid has no price risk: it
+  stays in RC with no add-on. Commodity type is an input (a policy choice, see CRE52.71).
 RC unmargined = max(V - C, 0); margined = max(V - C, TH + MTA - NICA, 0); margined EAD capped at
 the unmargined EAD (reported components are those of the binding branch). Zero once matured.
 """
@@ -19,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 from .collateral import vm_balance
+from .commodity.swap import CommoditySwapLeg
 from .market import MarketData
 from .model import CSA, OptionLeg, TRSLeg
 from .products.option import supervisory_delta
@@ -28,6 +34,11 @@ SF = {False: 0.32, True: 0.20}
 RHO = {False: 0.50, True: 0.80}
 SUP_VOL = {False: 1.20, True: 0.75}
 FLOOR_M = 10.0 / 250.0
+COM_RHO = 0.40
+
+
+def commodity_sf(commodity_type: str) -> float:
+    return 0.40 if commodity_type == "ELECTRICITY" else 0.18
 
 
 def maturity_factor(M: float, csa: CSA, margined: bool) -> float:
@@ -58,6 +69,10 @@ def leg_terms(leg, t: float, S_t, mkt: MarketData, ccy: str = "", fix=None):
     und = mkt.underlyings[leg.underlying]
     S_t = np.asarray(S_t, dtype=float)
     d = leg.shares * sa_price(leg, t, S_t, fix) * float(mkt.fx(und.ccy, ccy, t))
+    if isinstance(leg, CommoditySwapLeg):
+        p = mkt.commodity.products[und.product]
+        d = d if t < leg.fixing_t - 1e-12 else np.zeros_like(S_t)
+        return (p.hedging_set, p.commodity_type), False, d, np.full_like(S_t, leg.omega), leg.expiry - t
     if isinstance(leg, TRSLeg):
         M = (leg.next_reset_after(t) if leg.has_reset else leg.maturity) - t
         delta = np.full_like(S_t, leg.omega)
@@ -95,12 +110,14 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
         en_u[ent] = en_u.get(ent, 0.0) + delta * d * mf_u
         en_m[ent] = en_m.get(ent, 0.0) + delta * d * mf_m
         if breakdown:
+            com = isinstance(ent, tuple)
             rows.append(dict(trade_id=leg.trade_id, leg_id=leg.leg_id, leg_type=leg.kind,
-                             underlying=ent, sa_notional_basis=getattr(leg, "sa_notional_basis", "MARKET"),
+                             underlying=leg.underlying if com else ent, sa_notional_basis=getattr(leg, "sa_notional_basis", "MARKET"),
                              adjusted_notional=float(np.mean(d)),
                              supervisory_delta=float(np.mean(delta)), maturity_M=M,
                              _mf=(mf_u, mf_m), _en=(float(np.mean(delta * d * mf_u)),
-                                                    float(np.mean(delta * d * mf_m)))))
+                                                    float(np.mean(delta * d * mf_m))),
+                             **(dict(hedging_set=ent[0], commodity_type=ent[1]) if com else {})))
 
     zero = np.zeros_like(V)
     if not entities:              # netting set matured: no exposure, no RC floor
@@ -113,11 +130,20 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
     def addon(en):
         sys_ = 0.0
         idio = 0.0
+        sets: dict[str, list] = {}
         for ent, (is_idx,) in entities.items():
+            if isinstance(ent, tuple):
+                a = commodity_sf(ent[1]) * en[ent]
+                s = sets.setdefault(ent[0], [0.0, 0.0])
+                s[0], s[1] = s[0] + a, s[1] + a * a
+                continue
             a = SF[is_idx] * en[ent]
             sys_ = sys_ + RHO[is_idx] * a
             idio = idio + (1.0 - RHO[is_idx] ** 2) * a * a
-        return np.sqrt(sys_ * sys_ + idio) * np.ones_like(V)
+        out = np.sqrt(sys_ * sys_ + idio)
+        for net, sq in sets.values():
+            out = out + np.sqrt((COM_RHO * net) ** 2 + (1.0 - COM_RHO ** 2) * sq)
+        return out * np.ones_like(V)
 
     def mult(vc, ao):
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
@@ -126,7 +152,7 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
 
     def branch(rc, ao, vc):
         m = mult(vc, ao)
-        return dict(RC=rc, AddOn=ao, multiplier=m, PFE=m * ao, EAD=ALPHA * (rc + m * ao))
+        return dict(RC=rc, AddOn=ao, multiplier=m, PFE=m * ao, EAD=csa.sa_alpha * (rc + m * ao))
 
     nica = csa.nica
     vc_u = V - nica
@@ -149,7 +175,11 @@ def saccr(legs, t: float, S: dict, V, csa: CSA, mkt: MarketData, breakdown: bool
             r["effective_notional"] = r.pop("_en")[j]
         en = en_u if use_u else en_m
         res["legs"] = rows
-        res["entities"] = [dict(underlying=e, is_index=v[0], SF=SF[v[0]], rho=RHO[v[0]],
-                                entity_addon=float(np.mean(SF[v[0]] * en[e])))
-                           for e, v in entities.items()]
+        res["entities"] = [
+            dict(underlying=e[1], is_index=False, SF=commodity_sf(e[1]), rho=COM_RHO, hedging_set=e[0],
+                 commodity_type=e[1], entity_addon=float(np.mean(commodity_sf(e[1]) * en[e])))
+            if isinstance(e, tuple) else
+            dict(underlying=e, is_index=v[0], SF=SF[v[0]], rho=RHO[v[0]],
+                 entity_addon=float(np.mean(SF[v[0]] * en[e])))
+            for e, v in entities.items()]
     return res

@@ -39,12 +39,12 @@ INPUT_FILL = (255, 242, 204)
 CALC_FILL = (226, 239, 218)
 
 
-def quickstart_template() -> Path:
+def quickstart_template(name: str = NAME) -> Path:
     tmp = Path(tempfile.mkdtemp())
     exe = Path(sys.executable).with_name("xlwings.exe")
     cmd = [str(exe)] if exe.exists() else [sys.executable, "-m", "xlwings"]
-    subprocess.run(cmd + ["quickstart", NAME, "--standalone"], cwd=tmp, check=True)
-    return tmp / NAME / f"{NAME}.xlsm"
+    subprocess.run(cmd + ["quickstart", name, "--standalone"], cwd=tmp, check=True)
+    return tmp / name / f"{name}.xlsm"
 
 
 def header(sh, ncols, row=1):

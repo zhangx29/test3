@@ -11,6 +11,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .commodity import analytic as com
+from .commodity.swap import CommoditySwapLeg
 from .exposure import Results, build_grid, bucketise, netting_set_buckets
 from .market import MarketData
 from .model import NettingSet, OptionLeg, RunConfig
@@ -46,6 +48,8 @@ def _value(legs, t, St, Sfix, mkt):
 
 def ns_ee_nee(ns: NettingSet, mkt: MarketData, t: float, n: int = 201):
     legs = ns.legs
+    if any(isinstance(l, CommoditySwapLeg) for l in legs):
+        return com.ee_nee(legs, t, mkt) if com.is_commodity_set(legs) else (np.nan, np.nan)
     names = {l.underlying for l in legs}
     if len(names) != 1:
         return np.nan, np.nan
@@ -89,9 +93,21 @@ def run_analytic(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig
             res = [ns_ee_nee(ns, mkt, t, cfg.analytic_nodes) if t <= ns.maturity + 1e-9 else (0.0, 0.0)
                    for t in bt]
             ee, nee = np.array([r[0] for r in res]), np.array([r[1] for r in res])
+        approx = None
+        if com.is_commodity_set(ns.legs):      # exact moments + normal approximation, same bucketing
+            if mode == "AVERAGE":
+                a = np.array([com.conservative_profile(ns, t, mkt) for t in g])
+                approx = [bucketise(g, a[:, j], bt, mode) for j in range(6)]
+            else:
+                a = np.array([com.conservative_profile(ns, t, mkt) if t <= ns.maturity + 1e-9 else (0.0,) * 6
+                              for t in bt])
+                approx = [a[:, j] for j in range(6)]
         for k, (d, t) in enumerate(zip(bdates, bt)):
             rows.append(dict(netting_set=ns.netting_set, bucket_date=d, bucket_type=btype[k], t=t,
                              EE_analytic=ee[k], NEE_analytic=nee[k]))
+            if approx:
+                rows[-1].update(Sigma=approx[0][k], EE_normal=approx[1][k], NEE_normal=approx[2][k],
+                                PFE_normal=approx[3][k], AddOn_fwd=approx[4][k], SACCR_EAD_cons=approx[5][k])
     out = pd.DataFrame(rows)
     if mc is not None and len(out):
         m = mc.ns_profile[["netting_set", "t", "EE_uncoll", "NEE_uncoll", "EE_stderr"]]
@@ -99,4 +115,24 @@ def run_analytic(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig
         out = out.rename(columns={"EE_uncoll": "EE_MC_uncoll", "NEE_uncoll": "NEE_MC_uncoll"})
         out["EE_diff"] = out["EE_MC_uncoll"] - out["EE_analytic"]
         out["NEE_diff"] = out["NEE_MC_uncoll"] - out["NEE_analytic"]
+        mc.exposure_compare = exposure_compare(mc.ns_profile, out)
     return out
+
+
+def exposure_compare(profile: pd.DataFrame, analytic: pd.DataFrame) -> pd.DataFrame | None:
+    """Full simulation and analytic conservative EE / NEE / SA-CCR EAD, side by side per bucket."""
+    if "SACCR_EAD_cons" not in analytic:
+        return None
+    a = analytic[analytic["SACCR_EAD_cons"].notna()]
+    a = a[["netting_set", "t", "EE_analytic", "NEE_analytic", "EE_normal", "NEE_normal", "SACCR_EAD_cons"]]
+    m = profile[["netting_set", "ccy", "bucket_start", "bucket_date", "bucket_type", "t", "EE", "NEE",
+                 "SACCR_EAD_avg"]].merge(a, on=["netting_set", "t"])
+    m = m.rename(columns={"EE": "EE_sim", "NEE": "NEE_sim", "SACCR_EAD_avg": "SACCR_EAD_sim",
+                          "EE_analytic": "EE_exact", "NEE_analytic": "NEE_exact",
+                          "EE_normal": "EE_cons", "NEE_normal": "NEE_cons"})
+    for c, s, r in (("EE_cons", "EE_sim", "EE_cons_over_sim"), ("NEE_cons", "NEE_sim", "NEE_cons_over_sim"),
+                    ("SACCR_EAD_cons", "SACCR_EAD_sim", "EAD_cons_over_sim")):
+        m[r] = (m[c] / m[s].where(m[s] != 0)).astype(float)
+    return m[["netting_set", "ccy", "bucket_start", "bucket_date", "bucket_type", "t",
+              "EE_sim", "EE_exact", "EE_cons", "NEE_sim", "NEE_exact", "NEE_cons",
+              "SACCR_EAD_sim", "SACCR_EAD_cons", "EE_cons_over_sim", "NEE_cons_over_sim", "EAD_cons_over_sim"]]

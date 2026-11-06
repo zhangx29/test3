@@ -21,7 +21,7 @@ from .exposure import run_monte_carlo
 from .io_excel import INPUT_SHEETS, parse_inputs
 
 OUTPUT_SHEETS = ["Summary", "EE_NEE", "TradeExposure", "LegMTM", "SACCR_Legs", "SACCR_Entities",
-                 "AnalyticCheck", "GridProfile", "Warnings"]
+                 "SACCR_Proxy", "ExposureCompare", "AnalyticCheck", "GridProfile", "Warnings"]
 
 
 def read_sheets(wb) -> dict[str, pd.DataFrame]:
@@ -117,6 +117,8 @@ def run(wb, action: str):
         _charts(wb, res.ns_profile)
     if action in ("RUN_ALL", "RUN_ANALYTIC"):
         _write(wb, "AnalyticCheck", run_analytic(nss, mkt, cfg, res))
+        if res is not None and res.exposure_compare is not None and len(res.exposure_compare):
+            _write(wb, "ExposureCompare", res.exposure_compare)
     if res is None:
         _write(wb, "Warnings", pd.DataFrame({"warning": warnings or ["(none)"]}))
     _status(wb, f"{action} done in {time.time() - t0:.1f}s - {len(nss)} netting sets, "
