@@ -18,6 +18,8 @@ from .market import MarketData
 from .model import NettingSet, OptionLeg, RunConfig
 from .products import option_value, trs_value
 
+MAX_ANALYTIC_LEGS = 40      # commodity covariance loop is O(n^2) per date: long strips are MC only
+
 
 def _nodes(n: int, width: float = 8.0):
     x, w = np.polynomial.legendre.leggauss(n)
@@ -83,8 +85,18 @@ def run_analytic(netting_sets: list[NettingSet], mkt: MarketData, cfg: RunConfig
     mode = cfg.output_mode.upper()
     rows = []
     for ns in netting_sets:
+        if ns.value_source == "IMPORT":
+            continue                                    # imported PVs: no model to integrate
         bdates, bt, _, btype = netting_set_buckets(ns, cfg)
         g = grid[grid <= ns.maturity + 1e-9]
+        if com.is_commodity_set(ns.legs):
+            n_live = max(sum(l.live(t) for l in ns.legs) for t in g)
+            if n_live > MAX_ANALYTIC_LEGS:
+                msg = (f"AnalyticCheck skipped for {ns.netting_set}: up to {n_live} live commodity legs "
+                       f"(limit {MAX_ANALYTIC_LEGS}); Monte Carlo results only.")
+                if mc is not None and msg not in mc.warnings:
+                    mc.warnings.append(msg)
+                continue
         if mode == "AVERAGE":
             prof = np.array([ns_ee_nee(ns, mkt, t, cfg.analytic_nodes) for t in g])
             ee = bucketise(g, prof[:, 0], bt, mode)

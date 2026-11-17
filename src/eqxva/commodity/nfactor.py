@@ -55,9 +55,61 @@ def _step_root(model: CommodityModel, idx: np.ndarray, h: float) -> np.ndarray:
     return v * np.sqrt(np.maximum(w, 0.0))
 
 
-def simulate_futures(mkt, names: list[str], grid: np.ndarray, n_paths: int, seed: int = 42,
-                     antithetic: bool = True) -> dict[str, np.ndarray]:
-    """Return {contract: array (n_paths, len(grid))}; grid[0] must be 0."""
+class LazyContractPaths:
+    """Price paths of one futures contract, computed on demand from the shared factor states.
+
+    Behaves like the (n_paths, len(grid)) array it stands for under ``[rows, cols]`` indexing,
+    ``.shape`` and ``np.asarray``. Only the factor states are stored, so a long monthly strip (hundreds
+    of contracts) costs the memory of the factors, not of every contract. After its expiry the
+    contract holds its value at the last grid point on or before the expiry."""
+
+    def __init__(self, contract: FuturesContract, model: CommodityModel, grid: np.ndarray,
+                 Y: np.ndarray, col: dict[int, int]):
+        self.c, self.model, self.grid, self.Y = contract, model, grid, Y
+        self.i = model.index[contract.product]
+        self.cols = [col[int(f)] for f in self.i]
+        self.n_paths = Y.shape[1]
+        last = int(np.searchsorted(grid, contract.expiry_t + 1e-9, side="right")) - 1
+        self.last = max(last, 0)
+        # loadings w(t) and 1/2 Var[log F(t)] on every grid point, computed once (vectorised covariance)
+        ratio, beta = model.ratio[self.i], model.beta[self.i]
+        g = np.asarray(grid, dtype=float)
+        self.W = ratio[None, :] * contract.q_ref * np.exp(-beta[None, :] * (contract.expiry_t - g[:, None]))
+        la = ratio * contract.q_ref * np.exp(-beta * contract.expiry_t)
+        s = beta[:, None] + beta[None, :]
+        tt = np.clip(np.minimum(g, contract.expiry_t), 0.0, None)
+        A = np.outer(la, la) * model.corr[np.ix_(self.i, self.i)]
+        self.halfvar = 0.5 * np.einsum("ij,ijk->k", A, _g(s[:, :, None], tt[None, None, :]))
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.n_paths, len(self.grid))
+
+    def _column(self, k: int, rows=slice(None)) -> np.ndarray:
+        k = min(k, self.last)
+        c = self.c
+        if k == 0:
+            return np.full(self.Y[0][rows].shape[0], c.spot)
+        full = isinstance(rows, slice) and rows == slice(None)
+        Yk = self.Y[k] if full else self.Y[k][rows]
+        return c.spot * np.exp(Yk[:, self.cols] @ self.W[k] - self.halfvar[k])
+
+    def __getitem__(self, key):
+        rows, cols = key if isinstance(key, tuple) else (key, slice(None))
+        if isinstance(cols, (int, np.integer)):
+            k = int(cols)
+            return self._column(k + len(self.grid) if k < 0 else k, rows)
+        ks = np.arange(len(self.grid))[cols]
+        return np.column_stack([self._column(int(k), rows) for k in ks])
+
+    def __array__(self, dtype=None, copy=None):
+        a = self[:, :]
+        return a if dtype is None else a.astype(dtype)
+
+
+def simulate_factors(mkt, names: list[str], grid: np.ndarray, n_paths: int, seed: int = 42,
+                     antithetic: bool = True) -> dict[str, LazyContractPaths]:
+    """Simulate the factor states on the grid; return {contract: LazyContractPaths}. grid[0] must be 0."""
     assert abs(grid[0]) < 1e-12, "grid must start at 0"
     model: CommodityModel = mkt.commodity
     rng = np.random.default_rng([seed, 1])       # its own stream: equity paths never change
@@ -66,10 +118,8 @@ def simulate_futures(mkt, names: list[str], grid: np.ndarray, n_paths: int, seed
     idx = np.array(used)
     col = {f: k for k, f in enumerate(used)}
     half = (n_paths + 1) // 2 if antithetic else n_paths
-    Y = np.zeros((n_paths, len(idx)))
-    out = {n: np.empty((n_paths, len(grid))) for n in names}
-    for n, c in cs.items():
-        out[n][:, 0] = c.spot
+    Yh = np.zeros((len(grid), n_paths, len(idx)))   # factor state at each grid point
+    Y = Yh[0]
     roots: dict[int, np.ndarray] = {}
     beta = model.beta[idx]
     for k in range(1, len(grid)):
@@ -81,13 +131,12 @@ def simulate_futures(mkt, names: list[str], grid: np.ndarray, n_paths: int, seed
         if antithetic:
             Z = np.concatenate([Z, -Z], axis=0)[:n_paths]
         Y = Y * np.exp(-beta * h) + Z
-        t = float(grid[k])
-        for n, c in cs.items():
-            if t > c.expiry_t + 1e-9:
-                out[n][:, k] = out[n][:, k - 1]
-                continue
-            i = model.index[c.product]
-            w = model.ratio[i] * c.q_ref * np.exp(-model.beta[i] * (c.expiry_t - t))
-            cols = [col[int(f)] for f in i]
-            out[n][:, k] = c.spot * np.exp(Y[:, cols] @ w - 0.5 * covariance(model, c, t, c, t))
-    return out
+        Yh[k] = Y
+    return {n: LazyContractPaths(c, model, grid, Yh, col) for n, c in cs.items()}
+
+
+def simulate_futures(mkt, names: list[str], grid: np.ndarray, n_paths: int, seed: int = 42,
+                     antithetic: bool = True) -> dict[str, np.ndarray]:
+    """Return {contract: array (n_paths, len(grid))}; grid[0] must be 0."""
+    lazy = simulate_factors(mkt, names, grid, n_paths, seed, antithetic)
+    return {n: np.asarray(p) for n, p in lazy.items()}

@@ -16,6 +16,9 @@ AddOn_commodity = sum over hedging sets (no offset between them) of
   type, rho 40%, SF 18% (40% electricity). Long and short positions in one commodity type offset
   fully. Asset-class add-ons are summed. A leg that has fixed but not paid has no price risk: it
   stays in RC with no add-on. Commodity type is an input (a policy choice, see CRE52.71).
+  COMSWAP overrides (gas prepay): a leg outside its exposure window is not live; sa_maturity sets
+  M = sa_maturity - t; sa_keep_fixed keeps a fixed leg's notional at its fixing price while active;
+  sa_notional_basis AMORT scales d by (fixing - t) / (M_trade - t) (time-averaged notional).
 RC unmargined = max(V - C, 0); margined = max(V - C, TH + MTA - NICA, 0); margined EAD capped at
 the unmargined EAD (reported components are those of the binding branch). Zero once matured.
 """
@@ -62,17 +65,35 @@ def sa_price(leg, t: float, S_t, fix=None):
     return S_t
 
 
+def _commodity_terms(leg: CommoditySwapLeg, t: float, S_t, und, mkt: MarketData, ccy: str, fix):
+    """COMSWAP: d = quantity x price, 0 once fixed (unless sa_keep_fixed: then the fixing price while
+    the leg is active); AMORT scales d by (fixing - t) / (M_trade - t); M from sa_maturity if set."""
+    if not leg.active(t):
+        return None
+    p = mkt.commodity.products[und.product]
+    x = float(mkt.fx(und.ccy, ccy, t))
+    fixed = t >= leg.fixing_t - 1e-12
+    if not fixed:
+        d = leg.quantity * S_t * x
+    elif leg.sa_keep_fixed:
+        F = fix(leg.underlying, leg.fixing_t) if fix is not None else S_t
+        d = leg.quantity * np.asarray(F, dtype=float) * np.ones_like(S_t) * x
+    else:
+        d = np.zeros_like(S_t)
+    if leg.sa_notional_basis == "AMORT" and leg.sa_amort_T is not None and not fixed:
+        d = d * (leg.fixing_t - t) / max(leg.sa_amort_T - t, 1e-12)
+    return (p.hedging_set, p.commodity_type), False, d, np.full_like(S_t, leg.omega), leg.sa_M(t)
+
+
 def leg_terms(leg, t: float, S_t, mkt: MarketData, ccy: str = "", fix=None):
     """Return (entity, is_index, d, delta, M) for a live leg at t, else None; d in ``ccy``."""
     if leg.expiry <= t + 1e-12:
         return None
     und = mkt.underlyings[leg.underlying]
     S_t = np.asarray(S_t, dtype=float)
-    d = leg.shares * sa_price(leg, t, S_t, fix) * float(mkt.fx(und.ccy, ccy, t))
     if isinstance(leg, CommoditySwapLeg):
-        p = mkt.commodity.products[und.product]
-        d = d if t < leg.fixing_t - 1e-12 else np.zeros_like(S_t)
-        return (p.hedging_set, p.commodity_type), False, d, np.full_like(S_t, leg.omega), leg.expiry - t
+        return _commodity_terms(leg, t, S_t, und, mkt, ccy, fix)
+    d = leg.shares * sa_price(leg, t, S_t, fix) * float(mkt.fx(und.ccy, ccy, t))
     if isinstance(leg, TRSLeg):
         M = (leg.next_reset_after(t) if leg.has_reset else leg.maturity) - t
         delta = np.full_like(S_t, leg.omega)

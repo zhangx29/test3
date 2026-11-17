@@ -19,7 +19,11 @@ def run_file(inp: str | Path, out: str | Path | None = None, analytic: bool = Tr
         cfg.n_paths = n_paths
     if seed is not None:
         cfg.seed = seed
-    res = run_monte_carlo(nss, mkt, cfg, warnings)
+    cube = None
+    if any(ns.value_source == "IMPORT" for ns in nss):
+        from .pathimport import load_imports
+        cube = load_imports(sheets, Path(inp).resolve().parent, mkt)
+    res = run_monte_carlo(nss, mkt, cfg, warnings, imported=cube)
     if analytic:
         res.analytic = run_analytic(nss, mkt, cfg, res)
     if out:

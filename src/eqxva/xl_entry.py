@@ -21,7 +21,7 @@ from .exposure import run_monte_carlo
 from .io_excel import INPUT_SHEETS, parse_inputs
 
 OUTPUT_SHEETS = ["Summary", "EE_NEE", "TradeExposure", "LegMTM", "SACCR_Legs", "SACCR_Entities",
-                 "SACCR_Proxy", "ExposureCompare", "AnalyticCheck", "GridProfile", "Warnings"]
+                 "SACCR_Proxy", "SystemSACCR", "ExposureCompare", "AnalyticCheck", "GridProfile", "Warnings"]
 
 
 def read_sheets(wb) -> dict[str, pd.DataFrame]:
@@ -107,10 +107,17 @@ def run(wb, action: str):
     if action == "BBG_REFRESH":
         return bbg_refresh(wb)
     _status(wb, f"Running {action} ...")
-    mkt, nss, cfg, warnings = parse_inputs(read_sheets(wb))
+    sheets = read_sheets(wb)
+    mkt, nss, cfg, warnings = parse_inputs(sheets)
     res = None
     if action in ("RUN_ALL", "RUN_MC"):
-        res = run_monte_carlo(nss, mkt, cfg, warnings)
+        cube = None
+        if any(ns.value_source == "IMPORT" for ns in nss):
+            from pathlib import Path
+
+            from .pathimport import load_imports
+            cube = load_imports(sheets, Path(wb.fullname).resolve().parent, mkt)
+        res = run_monte_carlo(nss, mkt, cfg, warnings, imported=cube)
         for name, df in res.tables().items():
             if name != "AnalyticCheck":
                 _write(wb, name, df)

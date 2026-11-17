@@ -12,7 +12,7 @@ from datetime import date
 import numpy as np
 
 from . import dates as dt
-from .commodity.swap import build_commodity_swap
+from .commodity.swap import CommoditySwapLeg, build_commodity_swap, finalize_trade, overlap_warning
 from .market import MarketData
 
 log = logging.getLogger(__name__)
@@ -149,6 +149,8 @@ class NettingSet:
     counterparty: str = ""
     csa: CSA = field(default_factory=CSA)
     trades: list[Trade] = field(default_factory=list)
+    value_source: str = "MODEL"     # MODEL (simulated) or IMPORT (path-by-path PVs, see pathimport.py)
+    import_sa_price: str = "IMPLIED"   # IMPORT only: SA-CCR prices IMPLIED from each trade's PV, or FORWARD
 
     @property
     def legs(self):
@@ -345,7 +347,14 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
                   mpor_days=int(_f(r.get("mpor_days"), 10)), rounding=_f(r.get("rounding")),
                   ccy="" if _is_blank(r.get("csa_ccy")) else str(r["csa_ccy"]).strip().upper(),
                   sa_alpha=_f(r.get("sa_alpha"), 1.4))
-        sets[ns_id] = NettingSet(ns_id, str(r.get("counterparty") or ""), csa)
+        src = "MODEL" if _is_blank(r.get("value_source")) else str(r["value_source"]).strip().upper()
+        if src not in ("MODEL", "IMPORT"):
+            raise ValueError(f"Netting set {ns_id}: value_source must be MODEL or IMPORT (got '{src}')")
+        isp = "IMPLIED" if _is_blank(r.get("import_sa_price")) else str(r["import_sa_price"]).strip().upper()
+        if isp not in ("IMPLIED", "FORWARD"):
+            raise ValueError(f"Netting set {ns_id}: import_sa_price must be IMPLIED or FORWARD (got '{isp}')")
+        sets[ns_id] = NettingSet(ns_id, str(r.get("counterparty") or ""), csa, value_source=src,
+                                 import_sa_price=isp)
 
     trades: dict[str, Trade] = {}
     shocks: dict[str, float] = {}
@@ -389,4 +398,11 @@ def build_netting_sets(trade_rows: list[dict], ns_rows: list[dict], mkt: MarketD
         elif tr.netting_set != ns_id:
             raise ValueError(f"{r['trade_id']}: legs assigned to different netting sets")
         tr.legs.append(leg)
-    return [s for s in sets.values() if s.trades]
+    for tr in trades.values():
+        finalize_trade([l for l in tr.legs if isinstance(l, CommoditySwapLeg)], mkt.valuation_date, warnings)
+    out = [s for s in sets.values() if s.trades]
+    for s in out:
+        msg = overlap_warning(s.netting_set, [l for l in s.legs if isinstance(l, CommoditySwapLeg)])
+        if msg:
+            warnings.append(msg)
+    return out

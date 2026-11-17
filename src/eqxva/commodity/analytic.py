@@ -35,7 +35,7 @@ def _drivers(legs, t: float, mkt):
     terms: dict[tuple, float] = {}
     const = 0.0
     for l in legs:
-        if t >= l.payment_t - 1e-12:
+        if not l.live(t):              # paid, or outside its exposure window
             continue
         c = mkt.underlyings[l.underlying]
         a = (l.omega * l.quantity * float(mkt.und_curve(l.underlying).df_fwd(t, l.payment_t))

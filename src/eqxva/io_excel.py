@@ -32,7 +32,8 @@ from .market import MarketData, Underlying, VolSurface, ZeroCurve
 from .model import RunConfig, build_netting_sets
 
 INPUT_SHEETS = ["Config", "Market", "Curve", "FX", "VolSurface", "Correlation", "NettingSets", "Trades",
-                "CommodityProducts", "CommodityFactors", "FactorCorrelation", "Contracts"]
+                "CommodityProducts", "CommodityFactors", "FactorCorrelation", "Contracts", "PathImport",
+                "SystemRequests"]
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
