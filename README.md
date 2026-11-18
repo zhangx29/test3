@@ -383,6 +383,75 @@ File names are matched ignoring case, spaces, `.` and `_`. Per request id:
 - **Other outputs:** Summary gains `SACCR_EAD0_system`, and the `SystemSACCR` sheet lists every strip's path-mean RC, multiplier, PFE and EAD by date.
 - **Engine SA-CCR (`SACCR_EAD_*`):** these columns are still computed on the booked terms, so the system's EAD (as booked) and the engine's window treatment (two-month notional, M to the reset) sit side by side.
 - **Setup helper:** `prepay_examples.add_system_import(sheets, {"FE": [84 ids], "BE": [84 ids]}, folder="exports")` adds IMPORT netting sets `S84_<side>_<CSRA|NOCSRA|IM|NOIM>` with the 84 strips booked as windows, plus the SystemRequests sheet.
+- **`SystemRequests.folder`** can be relative to the input workbook, absolute, or a UNC path.
+- **t = 0 values:** Summary `MTM0` and `SACCR_EAD0` always use the engine's deterministic t = 0 value of the booked strips, even when the export has a t0 column. Buckets from the first export date on use the imported paths.
+
+### Running the system export (`run_system_export.py`)
+The archive holds one folder per request id: `\\cmcscpdsfil01\LITES_ARCHIVE\Intraday\Tertiary\output\reports\intraday\<request id>\`. Ids need not be consecutive. Each folder holds the RiskProfile files listed above, with 2,000 paths.
+
+```
+.venv\Scripts\python examples\prepay\run_system_export.py --requests req.csv [--side FE|BE] [--root <folder>]
+    [--curve examples\prepay\ng_curve.csv] [--name prepay_system] [--with-model] [--paths N]
+    [--check-only] [--no-snapshot] [--rebuild] [--no-analytic]
+```
+
+**Request list (`req.csv`, or `.xlsx`).**
+- `request_id` is required.
+- `side` (FE / BE) is optional; without it, `--side` applies to every row.
+- `strip` (0–83) is optional; without it, the row order is the strip order. Strip k covers delivery months k and k+1, with Jan27 = 0.
+- Each side needs 84 distinct ids.
+
+**Steps.**
+1. **Preflight** writes `examples\prepay\<name>_preflight.csv` with one row per strip. It checks:
+   - which files were found;
+   - the scenario and date counts, and that they are the same across requests;
+   - `base_max_abs`, which should be 0;
+   - the system t0 PV against the engine's booked MTM (`pv0_diff`), and its spread across paths (`sys_pv0_std` ≈ 0);
+   - `last_nonzero_date`, which must rise with the strip number (strip order);
+   - the SA-CCR path and date counts.
+
+   Missing files, or dates and scenario counts that differ between requests, stop the run. Smaller issues go in the `problem` column. `--check-only` stops after this step.
+2. **Snapshot:** the files are copied to `examples\prepay\system_export\<name>\<id>\` so the run can be repeated. `--no-snapshot` reads the share directly.
+3. **Workbook:** `examples\prepay\<name>.xlsx` is written only if it is missing, or with `--rebuild`.
+   - The valuation date is the export's first date, the buckets are the export dates, and the mode is POINT.
+   - It holds the IMPORT sets `S84_<side>_<CSRA|NOCSRA|IM|NOIM>`.
+   - `--with-model` adds the engine's simulated `B84_<side>_*` sets for comparison.
+4. **Run:** the results go to `examples\prepay\<name>_results.xlsx`, with two extra sheets:
+   - `PrepaySystem`: MTM0, peak EE, EPE, EEPE, peak PFE, and the engine and system EAD at t0 and at their peaks;
+   - `Preflight`: the preflight table.
+
+**Before relying on the numbers.**
+- `--curve` must match the system's curve; otherwise `pv0_diff` and the implied SA-CCR prices are off.
+- The Curve sheet still holds the flat 4% placeholder, and it is used for undiscounting.
+- Imported peak EE can sit slightly below the model's (`--with-model`), because the import sees only the export dates and misses the pre-settlement peaks.
+
+**How the 84 strips are combined.**
+- **Per-strip values.** Each request gives one matrix per strip: PV_k(path, date) = (Pos + Neg)_Test − (Pos + Neg)_Base, divided by DF.
+- **No double count.** Strip k is booked with both its months but is live only in month k: `active_from`/`active_to` on both legs, with strip 0 starting at the valuation date. Outside that window its PV is zeroed (`exposure._imported_value`). The one-month overlap between neighbouring strips is therefore never counted twice.
+- **Netting-set value.** The value is V(path, date) = Σ_k PV_k · 1[strip k live]: a single continuous two-month window value over all paths. Swap k's PV includes month k+1. It is still open whether the system's PV of strip k in month k includes month k after it has fixed; if it does not, the window carries one month only.
+- **XVA exposure** comes from V net of the static IA: EE, NEE, PFE, EPE/EEPE, `_disc`. `EE_uncoll`, `NEE_uncoll` and FCA/FBA come from V itself.
+- **Engine SA-CCR** runs path by path on all paths:
+  - The add-on uses each path's prices implied from the live strip's PV: the two-month notional, with M to the Dec 2033 reset.
+  - RC and the multiplier come from V − IA.
+  - EAD = 1.4 × (RC + multiplier × AddOn), reported as `SACCR_EAD_mean`.
+- **System SA-CCR** (`SACCR_EAD_system`) is selected, not combined path by path. At each bucket it is the path mean of the strip live then, at the last SA-CCR date on or before the bucket.
+  - `system_live_trades` should be 1 at every bucket.
+  - These are the system's as-booked, uncollateralised numbers: each request is a stand-alone two-month swap with M at its own end.
+
+### Changing the fixed price or the CSRA / IM
+Edit the generated workbook, then rerun **without** `--rebuild`, which would regenerate it and discard the edits. Work on a copy under a new `--name` so the base case stays.
+
+- **Fixed price, engine scenarios** (`run_prepay_scenarios.py --name <copy>`): Trades `fixed_price`, one row per monthly leg.
+  - Front end: rows of `*_FE_*` netting sets (direction BUY).
+  - Back end: rows of `*_BE_*` sets (direction SELL). The back end is $5.035 before Jan 2034 and $5.00 after; filter on `fixing_date` to change only one period.
+- **Fixed price, system import (`S84_*`): do not edit `fixed_price`.**
+  - The imported PVs already contain the price booked in the system. Editing the trades leaves exposure unchanged and makes the IMPLIED SA-CCR prices inconsistent, because r is solved with the new K against PVs at the old K.
+  - Rebook the strips in the system at the new price and run with the new request ids instead.
+  - A swap is linear in K, so PV_new = PV_old − ω·q·(K_new − K_old)·DF(t, pay) would be exact on each path, but this adjustment is not built.
+- **CSRA / IM:** NettingSets `ia_received` (USD, static) on `*_FE_CSRA` (front-end CSRA) and on `*_BE_IM` / `*_BE_IMVM` (back-end SPV IM). Keep `*_NOCSRA` / `*_NOIM` at 0.
+  - Works the same for MODEL and IMPORT sets.
+  - Changes: EE, NEE, PFE, EPE/EEPE and the engine's SA-CCR (RC and the multiplier).
+  - Unchanged: the `_uncoll` columns, FCA/FBA and `SACCR_EAD_system`, since the system ran without collateral.
 
 ### Validation (`tests/test_prepay.py`, illustrative inputs)
 - A windowed strip equals the explicit 84-trade booking path by path. Window EE matches exact quadrature, and, net of the CSRA, matches q × Black at strike K + C/q.
