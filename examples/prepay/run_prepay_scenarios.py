@@ -2,6 +2,7 @@
 
     .venv\\Scripts\\python examples\\prepay\\run_prepay_scenarios.py [--paths N] [--scenarios W7,F7,...]
                                                               [--vm-posting] [--no-analytic]
+                                                              [--volume MMBtu/d] [--im USD] [--csra USD]
 
 Writes examples\\prepay\\prepay_inputs.xlsx (if missing, or with --rebuild) and
 examples\\prepay\\prepay_inputs_results.xlsx with the usual sheets plus PrepayScenarios.
@@ -61,12 +62,23 @@ def main(argv=None):
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--curve", default=None, help="forward curve CSV (month,price); default flat F0")
     ap.add_argument("--name", default="prepay_inputs", help="input workbook base name")
+    ap.add_argument("--volume", type=float, default=None,
+                    help="MMBtu/day for every leg (default 20,000); applied only on (re)build")
+    ap.add_argument("--im", type=float, default=None,
+                    help="SPV IM, USD (default: 6.24mm scaled pro rata to --volume)")
+    ap.add_argument("--csra", type=float, default=None,
+                    help="CSRA, USD (default: 8mm scaled pro rata to --volume)")
     a = ap.parse_args(argv)
     inp = HERE / f"{a.name}.xlsx"
     if a.rebuild or not inp.exists():
         kw = dict(price=pe.curve_prices(pe.load_curve(a.curve))) if a.curve else {}
+        scale = (a.volume / pe.VOL_D) if a.volume else 1.0
+        if a.volume:
+            kw["vol_d"] = a.volume
+        kw["im"] = a.im if a.im is not None else pe.IM_SPV * scale
+        kw["csra"] = a.csra if a.csra is not None else pe.CSRA * scale
         pe.write_example_inputs(inp, scenarios=tuple(a.scenarios.split(",")), vm_posting=a.vm_posting, **kw)
-        print(f"wrote {inp}")
+        print(f"wrote {inp} (volume {kw.get('vol_d', pe.VOL_D):,.0f} MMBtu/d, IM {kw['im']:,.0f}, CSRA {kw['csra']:,.0f})")
     out = HERE / f"{a.name}_results.xlsx"
     t0 = time.time()
     res = run_file(inp, out, analytic=not a.no_analytic, n_paths=a.paths)
