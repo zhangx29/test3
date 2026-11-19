@@ -13,6 +13,7 @@ dependencies = ["numpy", "scipy", "pandas", "openpyxl"]
 excel = ["xlwings"]
 bloomberg = ["xbbg"]
 dev = ["pytest"]
+report = ["python-docx", "matplotlib"]
 
 [project.scripts]
 eqxva = "eqxva.cli:main"

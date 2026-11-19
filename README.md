@@ -444,10 +444,16 @@ Edit the generated workbook, then rerun **without** `--rebuild`, which would reg
 - **Fixed price, engine scenarios** (`run_prepay_scenarios.py --name <copy>`): Trades `fixed_price`, one row per monthly leg.
   - Front end: rows of `*_FE_*` netting sets (direction BUY).
   - Back end: rows of `*_BE_*` sets (direction SELL). The back end is $5.035 before Jan 2034 and $5.00 after; filter on `fixing_date` to change only one period.
+  - Script: `.venv\Scripts\python examples\prepay\set_fixed_price.py <workbook.xlsx> --side FE|BE --price 5.50 [--from DATE] [--until DATE] [--sets W7,F7] [--out new.xlsx]`. It skips IMPORT sets and prints how many legs it changed and what they were before.
 - **Fixed price, system import (`S84_*`): do not edit `fixed_price`.**
   - The imported PVs already contain the price booked in the system. Editing the trades leaves exposure unchanged and makes the IMPLIED SA-CCR prices inconsistent, because r is solved with the new K against PVs at the old K.
   - Rebook the strips in the system at the new price and run with the new request ids instead.
   - A swap is linear in K, so PV_new = PV_old − ω·q·(K_new − K_old)·DF(t, pay) would be exact on each path, but this adjustment is not built.
+- **Daily volume (MMBtu/d):** each leg's Trades `quantity` = days in its delivery month × volume.
+  - New workbook: `run_prepay_scenarios.py --volume 25000 --rebuild` (plus your usual `--curve`, `--name`, `--vm-posting`). The IM and CSRA scale pro rata (6.24mm and 8mm at 20,000/d) unless `--im` / `--csra` give them in USD.
+  - Workbook you have already edited: `.venv\Scripts\python examples\prepay\set_volume.py <workbook.xlsx> --volume 25000 [--side FE|BE] [--sets W7,W30] [--im USD] [--csra USD] [--no-collateral-scaling] [--out new.xlsx]`, then rerun without `--rebuild`. It rescales `quantity` and the IM/CSRA `ia_received` and skips IMPORT sets.
+  - System import (`S84_*`): the volume is in the system PVs, so rebook the strips at the new volume.
+  - `xva_writeup.py --volume 25000` so the spread PV and lost spread use the same volume.
 - **CSRA / IM:** NettingSets `ia_received` (USD, static) on `*_FE_CSRA` (front-end CSRA) and on `*_BE_IM` / `*_BE_IMVM` (back-end SPV IM). Keep `*_NOCSRA` / `*_NOIM` at 0.
   - Works the same for MODEL and IMPORT sets.
   - Changes: EE, NEE, PFE, EPE/EEPE and the engine's SA-CCR (RC and the multiplier).
